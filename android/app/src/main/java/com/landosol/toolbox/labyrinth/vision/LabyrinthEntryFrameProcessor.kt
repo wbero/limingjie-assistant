@@ -105,6 +105,7 @@ object EntryAnchorId {
     const val SESSION_DATE_CHANGE_TITLE = "session.date_change.title"
     const val SESSION_DATE_CHANGE_CONFIRM = "session.date_change.confirm"
     const val BATTLE_IN_PROGRESS_MENU_BUTTON = "battle.in_progress.menu_button"
+    const val BATTLE_IN_PROGRESS_AUTO_BUTTON = "battle.in_progress.auto_button"
     const val BATTLE_RESULT_REWARD_BANNER = "battle.result.reward_banner"
     const val BATTLE_RESULT_NEXT_BUTTON = "battle.result.next_button"
     const val BATTLE_RESULT_BOSS_SUMMARY_NEXT_BUTTON = "battle.result.boss_summary.next_button"
@@ -125,16 +126,6 @@ object EntryAnchorId {
     /** 主页面板顶部的「迷宫遗物效果」标题（迷宫大师开局赠送遗物弹窗）。 */
     const val RELIC_EFFECT_TITLE = "entry.relic_effect.title"
     const val RELIC_EFFECT_INSTRUCTION = "entry.relic_effect.instruction"
-    /**
-     * 「遗物效果结果」 -- a relic turned a lost battle into a won one.
-     *
-     * A third popup on the same 关闭-button family, but a *small centred dialog* rather than the
-     * full-height 获得道具 / 迷宫遗物效果 shell: its title sits at reference y 252 instead of 50 and
-     * its button at y 700 instead of 895, so neither existing anchor pair can see it. Unrecognised,
-     * it left the map visible behind itself and the run had no rule that could close it.
-     */
-    const val RELIC_EFFECT_RESULT_TITLE = "entry.relic_effect_result.title"
-    const val RELIC_EFFECT_RESULT_CLOSE = "entry.relic_effect_result.close"
 
     val required = setOf(
         TITLE_LOGO,
@@ -178,8 +169,6 @@ object EntryAnchorId {
         ITEM_REWARD_TITLE,
         ITEM_REWARD_INSTRUCTION,
         ITEM_REWARD_CLOSE,
-        RELIC_EFFECT_RESULT_TITLE,
-        RELIC_EFFECT_RESULT_CLOSE,
         SHOP_TITLE,
         SHOP_INSTRUCTION,
         SHOP_CLOSE,
@@ -218,6 +207,7 @@ object EntryAnchorId {
         SESSION_DATE_CHANGE_TITLE,
         SESSION_DATE_CHANGE_CONFIRM,
         BATTLE_IN_PROGRESS_MENU_BUTTON,
+        BATTLE_IN_PROGRESS_AUTO_BUTTON,
         BATTLE_RESULT_REWARD_BANNER,
         BATTLE_RESULT_NEXT_BUTTON,
         RUN_RESULT_LOGO,
@@ -828,6 +818,7 @@ class LabyrinthEntryFrameProcessor(
             // Same current-client drift for the date-change confirmation button.
             standard(EntryAnchorId.SESSION_DATE_CHANGE_CONFIRM, 753, 691, 415, 102),
             standard(EntryAnchorId.BATTLE_IN_PROGRESS_MENU_BUTTON, 1700, 36, 192, 50),
+            standard(EntryAnchorId.BATTLE_IN_PROGRESS_AUTO_BUTTON, 1786, 782, 106, 108),
             standard(EntryAnchorId.BATTLE_RESULT_REWARD_BANNER, 700, 270, 540, 82),
             standard(EntryAnchorId.BATTLE_RESULT_NEXT_BUTTON, 1452, 946, 388, 92),
             // Current 1920x1080 client Boss settlement pages place the same "下一步" button
@@ -856,9 +847,6 @@ class LabyrinthEntryFrameProcessor(
             // title and the two-line instruction differ; the close button is shared.
             standard(EntryAnchorId.RELIC_EFFECT_TITLE, 760, 50, 400, 75),
             standard(EntryAnchorId.RELIC_EFFECT_INSTRUCTION, 770, 150, 380, 65),
-            // Centred dialog: both rects are centred on x=960, measured off the 2026-09-22 report.
-            standard(EntryAnchorId.RELIC_EFFECT_RESULT_TITLE, 810, 262, 300, 62),
-            standard(EntryAnchorId.RELIC_EFFECT_RESULT_CLOSE, 750, 690, 415, 102),
         )
         val DEFINITIONS_BY_ID = DEFINITIONS.groupBy(EntryAnchorDefinition::id)
     }
@@ -922,15 +910,36 @@ class GradientTemplateMatcher(
 ) {
     private data class TemplateStats(
         val points: IntArray,
-        val gradients: DoubleArray,
-        val mean: Double,
+        /**
+         * Template gradients with the mean already subtracted, and template luminances with
+         * `luminanceMean` already subtracted.
+         *
+         * The correlation below multiplies every sample by `template - mean`, so that subtraction
+         * used to be redone for each of the ~2 000 samples of every window. Hoisting it is a pure
+         * move of the same IEEE operation, so the score keeps its exact bits, and it replaces the
+         * raw arrays rather than adding to them, so the resident template cache does not grow.
+         */
+        val centeredGradients: DoubleArray,
         val denominator: Double,
-        val luminances: DoubleArray,
-        val luminanceMean: Double,
+        val centeredLuminances: DoubleArray,
         val luminanceDenominator: Double,
     )
 
     private val cache = IdentityHashMap<PixelImage, TemplateStats>()
+
+    /**
+     * `map()` results for one (source size, target size) pair.
+     *
+     * Both sizes come from a handful of template and window dimensions, so these tables are tiny
+     * and are reused by every sample of every window in a sweep. The values are identical to
+     * calling [map] inline, including the clamp that keeps a sample inside the window. Both sizes
+     * stay far below 2^20, so packing a pair into one key cannot collide.
+     *
+     * [HashMap] on purpose: the sweep is single-threaded here, and this change deliberately keeps
+     * the threading work separate from the arithmetic one.
+     */
+    private val mappedOffsetCache = HashMap<Long, IntArray>()
+    private val rowScaledOffsetCache = HashMap<Long, IntArray>()
     private data class FrameStats(val frame: PixelImage, val lights: ByteArray, val gradients: ShortArray)
     private var preparedFrame: FrameStats? = null
     /**
@@ -978,30 +987,48 @@ class GradientTemplateMatcher(
         val stats = stats(template)
         if (stats.points.isEmpty()) return 0.0
         val features = preparedFrame?.takeIf { it.frame === frame }
+        // The template-to-frame coordinate mapping depends only on the two sizes, and those sizes
+        // repeat across the whole sweep, so the per-sample `map()` call, its long multiply, its
+        // integer division and its clamp are all hoisted out of the inner loop.
+        val xTable = mappedOffsets(template.width, rect.width)
+        val yTable = mappedOffsets(template.height, rect.height)
+        val yRowTable = rowScaledOffsets(template.height, rect.height, frame.width)
+        val rectBase = rect.top * frame.width + rect.left
+        val points = stats.points
+        val centeredGradients = stats.centeredGradients
+        val centeredLuminances = stats.centeredLuminances
         var observedSum = 0.0
         var observedSquares = 0.0
         var gradientProduct = 0.0
         var luminanceSum = 0.0
         var luminanceSquares = 0.0
         var luminanceProduct = 0.0
-        stats.points.indices.forEach { index ->
-            val packed = stats.points[index]
+        val count = points.size
+        var index = 0
+        while (index < count) {
+            val packed = points[index]
             val templateX = packed ushr 16
             val templateY = packed and 0xffff
-            val frameX = rect.left + map(templateX, template.width, rect.width)
-            val frameY = rect.top + map(templateY, template.height, rect.height)
-            val at = frameY * frame.width + frameX
-            val gradient = features?.gradients?.get(at)?.toDouble() ?: gradient(frame, frameX, frameY, rect)
-            val light = if (features != null) (features.lights[at].toInt() and 255).toDouble()
-                else luminance(frame[frameX, frameY]).toDouble()
+            val at = rectBase + yRowTable[templateY] + xTable[templateX]
+            val gradient: Double
+            val light: Double
+            if (features != null) {
+                gradient = features.gradients[at].toDouble()
+                light = (features.lights[at].toInt() and 255).toDouble()
+            } else {
+                val frameX = rect.left + xTable[templateX]
+                val frameY = rect.top + yTable[templateY]
+                gradient = gradient(frame, frameX, frameY, rect)
+                light = luminance(frame[frameX, frameY]).toDouble()
+            }
             observedSum += gradient
             observedSquares += gradient * gradient
-            gradientProduct += gradient * (stats.gradients[index] - stats.mean)
+            gradientProduct += gradient * centeredGradients[index]
             luminanceSum += light
             luminanceSquares += light * light
-            luminanceProduct += light * (stats.luminances[index] - stats.luminanceMean)
+            luminanceProduct += light * centeredLuminances[index]
+            index++
         }
-        val count = stats.points.size
         fun normalized(product: Double, sum: Double, squares: Double, denominator: Double): Double {
             val variance = squares - sum * sum / count
             return if (variance <= 0.0 || denominator <= 0.0) 0.0 else product / sqrt(variance * denominator)
@@ -1011,6 +1038,20 @@ class GradientTemplateMatcher(
         if (minOf(gradientScore, luminanceScore) < minimumChannelScore) return 0.0
         return maxOf(gradientScore, luminanceScore).coerceIn(0.0, 1.0)
     }
+
+    /** [mappedOffsets] for rows, pre-multiplied by the frame width so the inner loop only adds. */
+    private fun rowScaledOffsets(sourceSize: Int, targetSize: Int, frameWidth: Int): IntArray =
+        rowScaledOffsetCache.getOrPut(
+            (sourceSize.toLong() shl 40) or (targetSize.toLong() shl 20) or frameWidth.toLong(),
+        ) {
+            val rows = mappedOffsets(sourceSize, targetSize)
+            IntArray(rows.size) { index -> rows[index] * frameWidth }
+        }
+
+    private fun mappedOffsets(sourceSize: Int, targetSize: Int): IntArray =
+        mappedOffsetCache.getOrPut((sourceSize.toLong() shl 20) or targetSize.toLong()) {
+            IntArray(sourceSize) { value -> map(value, sourceSize, targetSize) }
+        }
 
     @Synchronized
     private fun stats(template: PixelImage): TemplateStats = cache[template] ?: run {
@@ -1045,11 +1086,14 @@ class GradientTemplateMatcher(
         }
         TemplateStats(
             points = points.toIntArray(),
-            gradients = values,
-            mean = mean,
+            // Same subtraction the correlation used to repeat per sample, applied once per point.
+            // `mean` and `denominator` above are still computed exactly as before, including the
+            // sequential summation order, because changing either would change the score.
+            centeredGradients = DoubleArray(values.size) { index -> values[index] - mean },
             denominator = denominator,
-            luminances = luminanceValues,
-            luminanceMean = luminanceMean,
+            centeredLuminances = DoubleArray(luminanceValues.size) { index ->
+                luminanceValues[index] - luminanceMean
+            },
             luminanceDenominator = luminanceDenominator,
         ).also { cache[template] = it }
     }
