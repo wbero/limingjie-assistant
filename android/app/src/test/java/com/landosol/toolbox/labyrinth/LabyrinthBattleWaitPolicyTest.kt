@@ -103,4 +103,19 @@ class LabyrinthBattleWaitPolicyTest {
     }
 
     private fun started() = LabyrinthBattleWaitPolicy().apply { onStartExecuted(0) }
+
+    @Test
+    fun `stale challenge frame after a challenge start keeps the wait for three seconds only`() {
+        val policy = started()
+        assertEquals(LabyrinthBattleWaitDecision.WAIT, policy.observe(Page.BATTLE_CHALLENGE, 400))
+        assertEquals(LabyrinthBattleWaitDecision.WAIT, policy.observe(Page.BATTLE_CHALLENGE, 2_999))
+        assertEquals(LabyrinthBattleWaitDecision.NONE, policy.observe(Page.BATTLE_CHALLENGE, 3_000))
+    }
+
+    @Test
+    fun `challenge grace ends once the battle has been seen`() {
+        val policy = started()
+        assertEquals(LabyrinthBattleWaitDecision.WAIT, policy.observe(Page.BATTLE_IN_PROGRESS, 1_000))
+        assertEquals(LabyrinthBattleWaitDecision.NONE, policy.observe(Page.BATTLE_CHALLENGE, 1_500))
+    }
 }

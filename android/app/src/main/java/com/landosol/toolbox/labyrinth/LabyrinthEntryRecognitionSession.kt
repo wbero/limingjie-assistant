@@ -5901,6 +5901,11 @@ class LabyrinthEntryRecognitionSession(
             when (actionResult) {
                 is AutomationActionResult.Executed -> {
                     lastPostEntryActionLandedAt = clock()
+                    if (kind == LabyrinthPostEntryActionKind.BATTLE_START_CHALLENGE) {
+                        // 「挑战」按钮同样会把游戏带进战斗。若只在编组页 START_BATTLE 处武装战斗等待器，
+                        // 经这条路径开打的长战斗（如 Boss 三连战）会被 30 秒 UNKNOWN 超时误杀。
+                        battleWait.onStartExecuted(clock())
+                    }
                     if (kind == LabyrinthPostEntryActionKind.EVENT_FREE_ROLE_SELECT && eventFreeRoleCandidateId != null) {
                         eventFreeRoleSelectedCharacterIds += eventFreeRoleCandidateId
                         eventFreeRoleLastSelectAt = clock()
