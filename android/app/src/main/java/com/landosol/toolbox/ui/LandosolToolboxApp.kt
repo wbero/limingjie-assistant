@@ -1,13 +1,20 @@
 package com.landosol.toolbox.ui
 
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Typography
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.DisposableEffect
@@ -31,7 +38,9 @@ import android.provider.Settings
 import android.media.projection.MediaProjectionManager
 import android.view.WindowManager
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.landosol.toolbox.LandosolToolboxApplication
@@ -168,22 +177,18 @@ fun LandosolToolboxApp() {
         topLevelDestinations.any { it.screen == candidate }
     } ?: AppScreen.Labyrinth
 
-    MaterialTheme {
-        Scaffold(
-            bottomBar = {
-                NavigationBar {
-                    topLevelDestinations.forEach { destination ->
-                        NavigationBarItem(
-                            selected = screen == destination.screen,
-                            onClick = { screenName = destination.screen.name },
-                            icon = { Text(destination.shortLabel) },
-                            label = { Text(destination.label) },
-                        )
-                    }
-                }
-            },
-        ) { outerPadding ->
-            Surface(modifier = Modifier.fillMaxSize().padding(outerPadding)) {
+    val configuration = LocalConfiguration.current
+    val compactLandscape = isCompactLandscape(
+        configuration.screenWidthDp,
+        configuration.screenHeightDp,
+    )
+    val sideNavigation = shouldUseNavigationRail(
+        configuration.screenWidthDp,
+        configuration.screenHeightDp,
+    )
+    MaterialTheme(typography = if (compactLandscape) CompactLandscapeTypography else Typography()) {
+        val destinationContent: @Composable (Modifier) -> Unit = { modifier ->
+            Surface(modifier = modifier.fillMaxSize()) {
                 when (screen) {
                     AppScreen.Accounts -> AccountRoute()
                     AppScreen.Labyrinth -> LabyrinthRoute(
@@ -197,6 +202,47 @@ fun LandosolToolboxApp() {
                     )
                     AppScreen.Permissions -> PermissionRoute(onStartCapture = requestCapture)
                 }
+            }
+        }
+        if (sideNavigation) {
+            Row(modifier = Modifier.fillMaxSize()) {
+                NavigationRail(modifier = Modifier.fillMaxHeight().width(64.dp)) {
+                    topLevelDestinations.forEach { destination ->
+                        NavigationRailItem(
+                            selected = screen == destination.screen,
+                            onClick = { screenName = destination.screen.name },
+                            icon = {
+                                Text(destination.shortLabel, style = MaterialTheme.typography.labelLarge)
+                            },
+                            label = {
+                                Text(destination.label, style = MaterialTheme.typography.labelSmall)
+                            },
+                            alwaysShowLabel = true,
+                        )
+                    }
+                }
+                destinationContent(Modifier.weight(1f))
+            }
+        } else {
+            Scaffold(
+                bottomBar = {
+                    NavigationBar(modifier = Modifier.height(64.dp)) {
+                        topLevelDestinations.forEach { destination ->
+                            NavigationBarItem(
+                                selected = screen == destination.screen,
+                                onClick = { screenName = destination.screen.name },
+                                icon = {
+                                    Text(destination.shortLabel, style = MaterialTheme.typography.labelLarge)
+                                },
+                                label = {
+                                    Text(destination.label, style = MaterialTheme.typography.labelSmall)
+                                },
+                            )
+                        }
+                    }
+                },
+            ) { outerPadding ->
+                destinationContent(Modifier.padding(outerPadding))
             }
         }
     }

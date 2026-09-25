@@ -38,7 +38,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -71,6 +70,8 @@ import com.landosol.toolbox.labyrinth.LabyrinthThirdBlockChoice
 import com.landosol.toolbox.labyrinth.LabyrinthUiState
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeTypes
 import com.landosol.toolbox.ui.account.GeetestCaptchaDialog
+import com.landosol.toolbox.ui.CompactTopBar
+import com.landosol.toolbox.ui.isCompactLandscape
 import kotlinx.coroutines.launch
 
 @Composable
@@ -96,7 +97,12 @@ fun LabyrinthScreen(
     onCancelCaptcha: () -> Unit,
     onOpenStrategies: () -> Unit = {},
 ) {
-    val compactWidth = LocalConfiguration.current.screenWidthDp < 600
+    val configuration = LocalConfiguration.current
+    val compactWidth = configuration.screenWidthDp < 600
+    val compactLandscape = isCompactLandscape(
+        configuration.screenWidthDp,
+        configuration.screenHeightDp,
+    )
     var confirmRetreat by remember(state.selectedAccount?.id) { mutableStateOf(false) }
     var showRerollSettings by remember(state.selectedAccount?.id) { mutableStateOf(false) }
     var showAdvancedTools by rememberSaveable { mutableStateOf(false) }
@@ -128,26 +134,24 @@ fun LabyrinthScreen(
     )
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("黎明界")
-                        Text(
-                            AppVersion.display,
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                },
-                navigationIcon = {
-                    onBack?.let { back -> TextButton(onClick = back) { Text("返回") } }
-                },
+            CompactTopBar(
+                title = "黎明界 · ${AppVersion.display}",
+                onBack = onBack,
                 actions = {
                     TextButton(
                         onClick = { showRerollSettings = true },
                         enabled = state.settingsReady && !state.isWorking && state.captcha == null,
-                    ) { Text(if (compactWidth) "刷取" else "刷开局设置") }
+                    ) {
+                        Text(
+                            if (compactWidth) "刷取" else "刷开局设置",
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                    }
                     TextButton(onClick = onOpenStrategies) {
-                        Text(if (compactWidth) "策略" else "策略设置")
+                        Text(
+                            if (compactWidth) "策略" else "策略设置",
+                            style = MaterialTheme.typography.labelLarge,
+                        )
                     }
                 },
             )
@@ -172,8 +176,13 @@ fun LabyrinthScreen(
                 .fillMaxSize()
                 .padding(padding)
                 .verticalScroll(scrollState)
-                .padding(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 152.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(
+                    start = if (compactLandscape) 8.dp else 16.dp,
+                    top = if (compactLandscape) 8.dp else 16.dp,
+                    end = if (compactLandscape) 8.dp else 16.dp,
+                    bottom = if (compactLandscape) 72.dp else 152.dp,
+                ),
+            verticalArrangement = Arrangement.spacedBy(if (compactLandscape) 8.dp else 12.dp),
         ) {
             WorkflowHeader()
             CurrentOpeningStep(
@@ -256,7 +265,7 @@ fun LabyrinthScreen(
 @Composable
 private fun WorkflowHeader() {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("自动执行", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text("自动执行", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         Text(
             "先登录并确认当前开局，再按批量目标连续执行。自动执行仍会准备新的目标开局。",
             style = MaterialTheme.typography.bodyMedium,
@@ -270,10 +279,10 @@ private fun WorkflowStepHeader(number: String, title: String, summary: String) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Surface(
-            modifier = Modifier.size(36.dp),
+            modifier = Modifier.size(28.dp),
             shape = CircleShape,
             color = MaterialTheme.colorScheme.primaryContainer,
         ) {
@@ -282,7 +291,7 @@ private fun WorkflowStepHeader(number: String, title: String, summary: String) {
             }
         }
         Column(modifier = Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text(summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -602,8 +611,8 @@ private fun AuxiliaryToolsSection(
         state.captcha == null &&
         !batchActive &&
         !entryRecognitionState.running
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("辅助工具", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        Text("辅助工具", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
         Text(
             "这些操作不属于日常两步流程，用于单独准备开局或诊断识别。",
             style = MaterialTheme.typography.bodySmall,
@@ -740,7 +749,7 @@ private fun BatchRunCard(
         LabyrinthBatchStage.RUNNING_LABYRINTH,
         LabyrinthBatchStage.RECORDING_RESULT,
     )
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
         WorkflowStepHeader(
             number = "2",
             title = "自动执行",
@@ -805,10 +814,11 @@ private fun BatchRunCard(
             Button(onClick = onStop) { Text("停止批量执行") }
         } else {
             Text("执行目标（留空 = 跳过该公会）", style = MaterialTheme.typography.titleSmall)
-            guildOptions.forEach { guild ->
+            @Composable
+            fun GoalEditor(guild: LabyrinthGuildOption, modifier: Modifier = Modifier) {
                 val text = counts.value[guild.guildId].orEmpty()
                 val mode = modes.value[guild.guildId] ?: LabyrinthBatchGoalMode.CLEARS
-                BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                BoxWithConstraints(modifier = modifier) {
                     val compact = maxWidth < 480.dp
                     @Composable fun CountField(modifier: Modifier) {
                         OutlinedTextField(
@@ -851,6 +861,26 @@ private fun BatchRunCard(
                             CountField(Modifier.weight(1f))
                             ModeChip()
                         }
+                    }
+                }
+            }
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                if (maxWidth >= 720.dp) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        guildOptions.chunked(2).forEach { pair ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                pair.forEach { guild -> GoalEditor(guild, Modifier.weight(1f)) }
+                                if (pair.size == 1) Box(modifier = Modifier.weight(1f))
+                            }
+                        }
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        guildOptions.forEach { guild -> GoalEditor(guild, Modifier.fillMaxWidth()) }
                     }
                 }
             }
@@ -897,14 +927,14 @@ private fun SelectionCard(
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f),
         ),
     ) {
         Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             description?.let { Text(it, style = MaterialTheme.typography.bodySmall) }

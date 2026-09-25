@@ -20,6 +20,7 @@ import com.landosol.toolbox.labyrinth.LabyrinthRelicMark
 import com.landosol.toolbox.labyrinth.LabyrinthStrategySettings
 import com.landosol.toolbox.labyrinth.LabyrinthStrategySettingsCodec
 import com.landosol.toolbox.labyrinth.LabyrinthRoleRatingItem
+import com.landosol.toolbox.ui.CompactTopBar
 import kotlin.math.roundToInt
 
 private val StrategySaver = Saver<LabyrinthStrategySettings, String>(
@@ -49,10 +50,10 @@ fun LabyrinthStrategySettingsScreen(
         Scaffold(
             modifier = Modifier.fillMaxSize(),
             topBar = {
-                TopAppBar(title = { Text("策略设置") }, navigationIcon = {
-                    TextButton(onClick = close, enabled = !saving) { Text("返回") }
-                }, actions = {
-                    TextButton(onClick = { confirmReset = true }, enabled = !saving) { Text("恢复默认") }
+                CompactTopBar(title = "策略设置", onBack = close, backEnabled = !saving, actions = {
+                    TextButton(onClick = { confirmReset = true }, enabled = !saving) {
+                        Text("恢复默认", style = MaterialTheme.typography.labelLarge)
+                    }
                 })
             },
             bottomBar = {
