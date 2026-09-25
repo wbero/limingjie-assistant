@@ -7,8 +7,8 @@ class AppVersionTest {
     @Test fun `the shipped version is the one this branch declares`() {
         // Diagnostic bundles are read against this constant, so a build.gradle bump that forgets
         // the rest of the release is worth a failing test rather than a silent mismatch.
-        assertEquals("1.0.13", AppVersion.name)
-        assertEquals(10013, AppVersion.code)
+        assertEquals("1.0.14", AppVersion.name)
+        assertEquals(10014, AppVersion.code)
     }
 
     @Test fun `every surface prints one label`() {
