@@ -21,8 +21,9 @@ class LabyrinthBattleEndConfirmationDetectorTest {
         assertNull(detector.detect(frame))
         val failure = requireNotNull(LabyrinthBattleFailureDetector().detect(frame))
         // 结束 centre on the 1178x663 screenshot: (705, 605) → 1080p (1149, 985).
-        val cx = failure.endButtonRect.left + failure.endButtonRect.width / 2
-        val cy = failure.endButtonRect.top + failure.endButtonRect.height / 2
+        val end = requireNotNull(failure.endButtonRect) { "this fixture is the three-button layout" }
+        val cx = end.left + end.width / 2
+        val cy = end.top + end.height / 2
         assertTrue("end centre ($cx,$cy)", cx in 640..770 && cy in 580..625)
     }
 

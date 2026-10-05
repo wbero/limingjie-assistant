@@ -27,6 +27,8 @@ import com.landosol.toolbox.labyrinth.vision.EntryPixelRect
 import com.landosol.toolbox.labyrinth.vision.LABYRINTH_BATTLE_CHARACTER_SAFE_CONFIDENCE
 import com.landosol.toolbox.labyrinth.vision.NODE_SEARCH_MODE_DEFERRED
 import com.landosol.toolbox.labyrinth.vision.LabyrinthBattleElementFilter
+import com.landosol.toolbox.labyrinth.vision.LabyrinthBattleFailureLayout
+import com.landosol.toolbox.labyrinth.vision.LabyrinthBattleFailureObservation
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryFrameResult
 import com.landosol.toolbox.labyrinth.vision.LabyrinthCharacterMatch
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryPageState
@@ -191,6 +193,49 @@ internal fun labyrinthBattleRetryLimit(kind: LabyrinthCombatKind): Int = when (k
     LabyrinthCombatKind.NORMAL,
     LabyrinthCombatKind.EX,
     -> 2
+}
+
+/**
+ * Whether the retry-context stop conditions apply to a recognised battle-failure page.
+ *
+ * The blue "重新挑战" button of the three-button layout consumes the run's retry budget, so the
+ * reroll-after-three-failures stop and the retry-limit / batch-limit stops belong to it. The
+ * two-button layout's lower-right button reads "下一步": it advances the relic-revive chain, and
+ * rerolling or ending the run there would throw away the run that was just revived. See
+ * `android/docs/relic-revive-battle-failure-audit.md`, section 「3. 实现级设计」.
+ */
+internal fun labyrinthBattleFailureUsesRetryBudget(layout: LabyrinthBattleFailureLayout): Boolean =
+    layout != LabyrinthBattleFailureLayout.TWO_BUTTON
+
+/**
+ * The post-entry tap a recognised battle-failure page offers.
+ *
+ * Both layouts expose the same lower-right blue button and therefore the same rect; only the kind
+ * differs, and with it the accounting in `dispatchPostEntryTap`. Extracted so both layouts stay
+ * pinned by tests instead of by reading the plan branch.
+ */
+internal fun labyrinthBattleFailureTapPlan(
+    failure: LabyrinthBattleFailureObservation,
+    pendingSingleBossFallbackToMulti: Boolean,
+): LabyrinthPostEntryTapPlan = when (failure.layout) {
+    LabyrinthBattleFailureLayout.TWO_BUTTON -> LabyrinthPostEntryTapPlan(
+        LabyrinthPostEntryActionKind.BATTLE_FAILURE_NEXT,
+        "战斗失败页(遗物复活)：下一步",
+        failure.retryButtonRect,
+    )
+    LabyrinthBattleFailureLayout.THREE_BUTTON -> if (pendingSingleBossFallbackToMulti) {
+        LabyrinthPostEntryTapPlan(
+            LabyrinthPostEntryActionKind.BATTLE_RETRY_SWITCH_MULTI,
+            "Boss单队达到设定重试次数：切换多队重新挑战",
+            failure.retryButtonRect,
+        )
+    } else {
+        LabyrinthPostEntryTapPlan(
+            LabyrinthPostEntryActionKind.BATTLE_RETRY,
+            "战斗失败：重新挑战",
+            failure.retryButtonRect,
+        )
+    }
 }
 
 /** Number of automatic retry taps allowed before the current failed page becomes terminal. */
@@ -4735,71 +4780,79 @@ class LabyrinthEntryRecognitionSession(
                 finishFromPlanner(sessionId, "已识别战斗失败页，但缺少本次战斗上下文；未自动点击结束或重新挑战")
                 return
             }
-            if (!pendingSingleBossFallbackToMulti) {
-                pendingSingleBossFallbackToMulti = labyrinthShouldSwitchSingleBossToMulti(
-                    enabled = singleBossFallbackToMultiAfterThreeFailures,
+            // The two-button layout's lower-right button reads "下一步": it advances to the
+            // "遗物效果结果" popup instead of retrying, so the three stop conditions below — which
+            // exist for a run that keeps losing the same fight — must not apply to it. They would
+            // otherwise reroll or end the run that was just revived. The three-button page and the
+            // defensive path for a missing observation keep their exact previous behaviour.
+            val advanceOnly = result.battleFailure?.layout == LabyrinthBattleFailureLayout.TWO_BUTTON
+            if (!advanceOnly) {
+                if (!pendingSingleBossFallbackToMulti) {
+                    pendingSingleBossFallbackToMulti = labyrinthShouldSwitchSingleBossToMulti(
+                        enabled = singleBossFallbackToMultiAfterThreeFailures,
+                        kind = context.kind,
+                        mode = bossTeamMode,
+                        battleRetryCount = battleRetryCount,
+                        retryCountBeforeMulti = singleBossRetryCountBeforeMulti,
+                    )
+                }
+                val singleBossFallbackOwnsFailurePolicy =
+                    context.kind == LabyrinthCombatKind.BOSS &&
+                        bossTeamMode == LabyrinthBossTeamMode.SINGLE_TEAM &&
+                        singleBossFallbackToMultiAfterThreeFailures
+                if (
+                    !_state.value.dryRun &&
+                    !pendingSingleBossFallbackToMulti &&
+                    !singleBossFallbackOwnsFailurePolicy &&
+                    labyrinthShouldRerollAfterBattleFailure(
+                        rerollAfterThreeFailures = rerollAfterThreeBattleFailures,
+                        battleRetryCount = battleRetryCount,
+                    )
+                ) {
+                    finishFromPlannerAndRequestReroll(
+                        sessionId,
+                        "${labyrinthBattleKindLabel(context.kind)}连续3次挑战失败，不结算当前战斗",
+                    )
+                    return
+                }
+                val retryLimit = labyrinthEffectiveBattleRetryLimit(
                     kind = context.kind,
-                    mode = bossTeamMode,
-                    battleRetryCount = battleRetryCount,
-                    retryCountBeforeMulti = singleBossRetryCountBeforeMulti,
-                )
-            }
-            val singleBossFallbackOwnsFailurePolicy =
-                context.kind == LabyrinthCombatKind.BOSS &&
-                    bossTeamMode == LabyrinthBossTeamMode.SINGLE_TEAM &&
-                    singleBossFallbackToMultiAfterThreeFailures
-            if (
-                !_state.value.dryRun &&
-                !pendingSingleBossFallbackToMulti &&
-                !singleBossFallbackOwnsFailurePolicy &&
-                labyrinthShouldRerollAfterBattleFailure(
                     rerollAfterThreeFailures = rerollAfterThreeBattleFailures,
-                    battleRetryCount = battleRetryCount,
+                    singleBossFallbackRetryCount = singleBossRetryCountBeforeMulti.takeIf {
+                        singleBossFallbackToMultiAfterThreeFailures &&
+                            bossTeamMode == LabyrinthBossTeamMode.SINGLE_TEAM
+                    },
                 )
-            ) {
-                finishFromPlannerAndRequestReroll(
-                    sessionId,
-                    "${labyrinthBattleKindLabel(context.kind)}连续3次挑战失败，不结算当前战斗",
-                )
-                return
-            }
-            val retryLimit = labyrinthEffectiveBattleRetryLimit(
-                kind = context.kind,
-                rerollAfterThreeFailures = rerollAfterThreeBattleFailures,
-                singleBossFallbackRetryCount = singleBossRetryCountBeforeMulti.takeIf {
-                    singleBossFallbackToMultiAfterThreeFailures &&
-                        bossTeamMode == LabyrinthBossTeamMode.SINGLE_TEAM
-                },
-            )
-            if (
-                !_state.value.dryRun &&
-                !pendingSingleBossFallbackToMulti &&
-                labyrinthBatchOwnedRunEndsAtRetryLimit(
-                    batchOwnsRun = currentRunId != null,
-                    battleRetryCount = battleRetryCount,
-                    retryLimit = retryLimit,
-                )
-            ) {
-                // The batch rerolls and invalidates the failure page itself; the run just ends
-                // with FAILED_MAX_RETRY and leaves capture alive for the next run.
-                finishFromPlannerAndRequestReroll(
-                    sessionId,
-                    "${labyrinthBattleKindLabel(context.kind)}已达到自动重试上限：" +
-                        "已重试${battleRetryCount}次；本局按失败计入批次",
-                )
-                return
-            }
-            if (!pendingSingleBossFallbackToMulti && battleRetryCount >= retryLimit) {
-                finishFromPlanner(
-                    sessionId,
-                    "${labyrinthBattleKindLabel(context.kind)}已达到自动重试上限：" +
-                        "已重试${battleRetryCount}次；保留在失败页，不自动点击结束",
-                )
-                return
-            }
-            if (result.battleFailure == null) {
-                finishFromPlanner(sessionId, "战斗失败页按钮结构未达到安全线；不执行固定坐标重试")
-                return
+                if (
+                    !_state.value.dryRun &&
+                    !pendingSingleBossFallbackToMulti &&
+                    labyrinthBatchOwnedRunEndsAtRetryLimit(
+                        batchOwnsRun = currentRunId != null,
+                        battleRetryCount = battleRetryCount,
+                        retryLimit = retryLimit,
+                    )
+                ) {
+                    // The batch rerolls and invalidates the failure page itself; the run just ends
+                    // with FAILED_MAX_RETRY and leaves capture alive for the next run.
+                    finishFromPlannerAndRequestReroll(
+                        sessionId,
+                        "${labyrinthBattleKindLabel(context.kind)}已达到自动重试上限：" +
+                            "已重试${battleRetryCount}次；本局按失败计入批次",
+                    )
+                    return
+                }
+                if (!pendingSingleBossFallbackToMulti && battleRetryCount >= retryLimit) {
+                    finishFromPlanner(
+                        sessionId,
+                        "${labyrinthBattleKindLabel(context.kind)}已达到自动重试上限：" +
+                            "已重试${battleRetryCount}次；保留在失败页，不自动点击结束",
+                    )
+                    return
+                }
+                if (result.battleFailure == null) {
+                    finishFromPlanner(sessionId, "战斗失败页按钮结构未达到安全线；不执行固定坐标重试")
+                    return
+                }
             }
         }
         if (pageState == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) {
@@ -5280,19 +5333,9 @@ class LabyrinthEntryRecognitionSession(
 
             LabyrinthEntryPageState.BATTLE_FAILED ->
                 result.battleFailure?.let { failure ->
-                    if (pendingSingleBossFallbackToMulti) {
-                        LabyrinthPostEntryTapPlan(
-                            LabyrinthPostEntryActionKind.BATTLE_RETRY_SWITCH_MULTI,
-                            "Boss单队达到设定重试次数：切换多队重新挑战",
-                            failure.retryButtonRect,
-                        )
-                    } else {
-                        LabyrinthPostEntryTapPlan(
-                            LabyrinthPostEntryActionKind.BATTLE_RETRY,
-                            "战斗失败：重新挑战",
-                            failure.retryButtonRect,
-                        )
-                    }
+                    // Both layouts tap the same lower-right button; only the kind and its
+                    // accounting differ.
+                    labyrinthBattleFailureTapPlan(failure, pendingSingleBossFallbackToMulti)
                 }
 
             LabyrinthEntryPageState.BATTLE_CHALLENGE ->
@@ -5997,6 +6040,15 @@ class LabyrinthEntryRecognitionSession(
                         LabyrinthPostEntryActionKind.EX_CLOSE_DETAIL -> {
                             exSlot3ProbePending = false
                             exEncounterProbeStartedAt = Long.MIN_VALUE
+                        }
+                        LabyrinthPostEntryActionKind.BATTLE_FAILURE_NEXT -> {
+                            // "下一步" advances the relic-revive chain, it does not retry: spending
+                            // the retry budget or clearing the failed-team books here would book the
+                            // run wrongly. Only cancel the battle wait and reset the frame budget,
+                            // so the "遗物效果结果" popup that follows is handled as a new page.
+                            battleWait.reset()
+                            postEntryStableFrames = 0
+                            postEntryAttempts = 0
                         }
                         LabyrinthPostEntryActionKind.BATTLE_RETRY,
                         LabyrinthPostEntryActionKind.BATTLE_RETRY_SWITCH_MULTI,

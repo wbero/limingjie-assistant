@@ -45,6 +45,11 @@ internal enum class LabyrinthPostEntryActionKind {
     BATTLE_START_CHALLENGE,
     BATTLE_RETRY,
     BATTLE_RETRY_SWITCH_MULTI,
+    /**
+     * 两键战斗失败页（遗物复活变体）的右下按钮写的是「下一步」：它推进遗物效果结果弹窗，不是重新
+     * 挑战，因此不消耗重试预算、不动失败队伍记账。点击矩形与 [BATTLE_RETRY] 相同（同一个按钮槽位）。
+     */
+    BATTLE_FAILURE_NEXT,
     BATTLE_RESULT_NEXT,
     BOSS_SETTLEMENT_NEXT,
 
