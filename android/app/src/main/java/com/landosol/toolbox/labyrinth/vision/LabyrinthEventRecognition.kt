@@ -48,6 +48,37 @@ data class LabyrinthEventChoiceObservation(
     val trusted: Boolean,
 )
 
+data class LabyrinthEventOcrCacheDiagnostics(
+    val status: String,
+    val ageMillis: Long?,
+    val fingerprintDistance: Int?,
+    val cachedCropRect: EntryPixelRect?,
+    val cachedRequestId: Long?,
+    val pendingRequestId: Long?,
+    val pendingAgeMillis: Long?,
+    val lastCompletedRequestId: Long?,
+    val lastRequestDurationMillis: Long?,
+    val lastResultTextLength: Int?,
+    val lastResultStatus: String?,
+    val cacheLifetimeMillis: Long,
+)
+
+data class LabyrinthEventOcrDiagnostics(
+    val status: String,
+    val cropRect: EntryPixelRect? = null,
+    val fingerprint: String? = null,
+    val completeLayoutCount: Int? = null,
+    val buttonConfidencesByOptionCount: Map<Int, List<Double>> = emptyMap(),
+    val cache: LabyrinthEventOcrCacheDiagnostics? = null,
+    val requestScheduled: Boolean = false,
+    val rawText: String? = null,
+    val candidateEventId: String? = null,
+    val candidateScore: Double? = null,
+    val rivalMargin: Double? = null,
+    val stableFrames: Int = 0,
+    val trusted: Boolean = false,
+)
+
 /**
  * Matches one OCR block against the database-backed event catalog. Shared event titles are
  * deliberately not sufficient: labels, effects and numeric rewards all participate so the four

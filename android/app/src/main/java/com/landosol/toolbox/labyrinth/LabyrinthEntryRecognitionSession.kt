@@ -2757,6 +2757,9 @@ class LabyrinthEntryRecognitionSession(
         val observation = result.eventChoiceSelection
         if (result.observation.state != LabyrinthEntryPageState.EVENT_CHOICE || observation == null) {
             if (_state.value.eventChoiceDecision != null) {
+                nodeLog("event-choice-decision-cleared page=${result.observation.state} " +
+                    "ocr=${result.eventOcrDiagnostics?.status} cache=${result.eventOcrDiagnostics?.cache?.status} " +
+                    "cacheAgeMillis=${result.eventOcrDiagnostics?.cache?.ageMillis}")
                 _state.value = _state.value.copy(eventChoiceDecision = null)
             }
             return
@@ -5154,6 +5157,10 @@ class LabyrinthEntryRecognitionSession(
                 // while the truth was that the tap had already been sent and lost (2026-09-20
                 // bundle 133934: 323 s on one EVENT_CHOICE page, actionCount frozen at 271).
                 if (eventChoiceCommitted) {
+                    nodeLog("event-choice-retry elapsedMillis=${timestampMillis - eventChoiceCommittedAt} " +
+                        "choiceId=$eventChoiceCommittedChoiceId attempts=$eventChoiceCommitAttempts " +
+                        "event=${result.eventChoiceSelection?.event?.id} " +
+                        "ocr=${result.eventOcrDiagnostics?.status} cache=${result.eventOcrDiagnostics?.cache?.status}")
                     eventChoiceCommitted = false
                     eventChoiceCommitAttempts++
                     // The tap landed and the page did not move on. That option is gated -- the
@@ -5177,6 +5184,10 @@ class LabyrinthEntryRecognitionSession(
                     }
                     is LabyrinthEventChoiceDecision.Wait -> null
                     null -> labyrinthSingleChoiceEventButtonRect(result)?.let { rect ->
+                        nodeLog("event-choice-fallback source=SINGLE_CHOICE_ANCHORS rect=$rect " +
+                            "layoutCount=${result.eventOcrDiagnostics?.completeLayoutCount} " +
+                            "ocr=${result.eventOcrDiagnostics?.status} " +
+                            "cache=${result.eventOcrDiagnostics?.cache?.status} rejected=$eventChoiceRejectedIds")
                         LabyrinthPostEntryTapPlan(
                             LabyrinthPostEntryActionKind.SELECT_EVENT,
                             "选择事件：唯一选项（单选事件结构确认）",

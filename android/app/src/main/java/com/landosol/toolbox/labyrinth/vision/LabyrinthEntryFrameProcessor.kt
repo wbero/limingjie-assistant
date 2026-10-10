@@ -334,6 +334,7 @@ data class LabyrinthEntryFrameResult(
     val linkChoiceSelection: LabyrinthLinkChoiceObservation? = null,
     val relicChoiceSelection: LabyrinthRelicChoiceObservation? = null,
     val eventChoiceSelection: LabyrinthEventChoiceObservation? = null,
+    val eventOcrDiagnostics: LabyrinthEventOcrDiagnostics? = null,
     val nodeRelicStackObservation: LabyrinthNodeRelicStackObservation? = null,
     val relicDetailObservation: LabyrinthRelicDetailObservation? = null,
     val shopObservation: LabyrinthShopObservation? = null,

@@ -2,6 +2,7 @@ package com.landosol.toolbox.labyrinth.vision
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.util.Log
 import com.landosol.toolbox.gamedata.EventResource
 import com.landosol.toolbox.gamedata.LabyrinthEventOcrDocument
 import kotlin.math.roundToInt
@@ -63,7 +64,7 @@ class AndroidLabyrinthEventChoiceResolver(
     fun resolve(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {
         if (result.nodeMoveConfirmation != null || result.observation.state !in ELIGIBLE_STATES) {
             clearPageState()
-            return result
+            return result.copy(eventOcrDiagnostics = LabyrinthEventOcrDiagnostics("INELIGIBLE_PAGE_OR_MOVE_DIALOG"))
         }
         // UNKNOWN occurs during many unrelated animations.  Infer the visible option count from
         // the calibrated blue buttons instead of merely asking whether *any* layout overlaps blue
@@ -78,7 +79,9 @@ class AndroidLabyrinthEventChoiceResolver(
             .any { it >= MINIMUM_EVENT_BUTTON_CANDIDATE }
         if (!hasAnyEventButtonEvidence) {
             clearPageState()
-            return result
+            return result.copy(eventOcrDiagnostics = LabyrinthEventOcrDiagnostics(
+                "NO_BUTTON_EVIDENCE", buttonConfidencesByOptionCount = confidencesByOptionCount,
+            ))
         }
         val completeLayoutCount = labyrinthCompleteEventLayoutCount(
             confidencesByOptionCount = confidencesByOptionCount,
@@ -95,31 +98,48 @@ class AndroidLabyrinthEventChoiceResolver(
             frameHeight = bitmap.height,
             referenceSize = STANDARD_REFERENCE,
             referenceRect = OCR_REFERENCE_RECT,
-        ) ?: return result
+        ) ?: return result.copy(eventOcrDiagnostics = LabyrinthEventOcrDiagnostics("INVALID_CROP"))
         val fingerprint = differenceHash(bitmap, cropRect)
-        val observedText = ocrCache.read(
+        val lookup = ocrCache.lookup(
             LabyrinthEventOcrCache.Key(fingerprint, cropRect),
             android.os.SystemClock.elapsedRealtime(),
         )
+        val diagnostic = LabyrinthEventOcrDiagnostics(
+            status = "CACHE_LOOKUP",
+            cropRect = cropRect,
+            fingerprint = java.lang.Long.toHexString(fingerprint),
+            completeLayoutCount = completeLayoutCount,
+            buttonConfidencesByOptionCount = confidencesByOptionCount,
+            cache = lookup.diagnostics,
+        )
+        val observedText = lookup.text
         if (observedText == null) {
             lastEventId = null
             stableFrames = 0
-            schedule(bitmap, cropRect, fingerprint)
-            return result
+            val scheduled = schedule(bitmap, cropRect, fingerprint)
+            return result.copy(eventOcrDiagnostics = diagnostic.copy(
+                status = "WAITING_OCR", requestScheduled = scheduled,
+            ))
         }
 
         val match = recognizer.recognize(observedText)
         val event = match.event ?: run {
             lastEventId = null
             stableFrames = 0
-            retryOcr(bitmap, cropRect, fingerprint)
-            return result
+            val scheduled = retryOcr(bitmap, cropRect, fingerprint)
+            return result.copy(eventOcrDiagnostics = diagnostic.copy(
+                status = "NO_CATALOG_MATCH", requestScheduled = scheduled,
+                rawText = observedText.take(MAX_DIAGNOSTIC_TEXT_LENGTH),
+                candidateScore = match.score, rivalMargin = match.margin,
+            ))
         }
         stableFrames = if (lastEventId == event.id) stableFrames + 1 else 1
         lastEventId = event.id
         val orderedChoices = event.choices.sortedBy { it.slot }
         val buttonRects = layoutMapper.buttonRects(orderedChoices.size, bitmap.width, bitmap.height)
-        if (buttonRects.size != orderedChoices.size) return result
+        if (buttonRects.size != orderedChoices.size) return result.copy(eventOcrDiagnostics = diagnostic.copy(
+            status = "BUTTON_MAPPING_FAILED", candidateEventId = event.id, stableFrames = stableFrames,
+        ))
         val visuals = orderedChoices.zip(buttonRects).map { (choice, rect) ->
             LabyrinthEventChoiceVisual(
                 choice = choice,
@@ -129,9 +149,9 @@ class AndroidLabyrinthEventChoiceResolver(
             )
         }
         val trusted = match.trusted && stableFrames >= REQUIRED_STABLE_FRAMES
-        if (!match.trusted && stableFrames >= REQUIRED_STABLE_FRAMES) {
+        val scheduled = if (!match.trusted && stableFrames >= REQUIRED_STABLE_FRAMES) {
             retryOcr(bitmap, cropRect, fingerprint)
-        }
+        } else false
         val eventObservation = LabyrinthEventChoiceObservation(
             event = event,
             choices = visuals,
@@ -164,34 +184,49 @@ class AndroidLabyrinthEventChoiceResolver(
             ),
             matchedFeatures = (result.matchedFeatures + EVENT_OCR_FEATURE).distinct(),
             eventChoiceSelection = eventObservation,
+            eventOcrDiagnostics = diagnostic.copy(
+                status = if (trusted) "TRUSTED_MATCH" else "CANDIDATE_MATCH",
+                requestScheduled = scheduled,
+                rawText = observedText.take(MAX_DIAGNOSTIC_TEXT_LENGTH),
+                candidateEventId = event.id,
+                candidateScore = match.score,
+                rivalMargin = match.margin,
+                stableFrames = stableFrames,
+                trusted = trusted,
+            ),
         )
     }
 
-    private fun schedule(bitmap: Bitmap, rect: EntryPixelRect, fingerprint: Long) {
+    private fun schedule(bitmap: Bitmap, rect: EntryPixelRect, fingerprint: Long): Boolean {
         val now = android.os.SystemClock.elapsedRealtime()
-        val requestId = ocrCache.begin(LabyrinthEventOcrCache.Key(fingerprint, rect), now) ?: return
+        val requestId = ocrCache.begin(LabyrinthEventOcrCache.Key(fingerprint, rect), now) ?: return false
         val crop = Bitmap.createBitmap(bitmap, rect.left, rect.top, rect.width, rect.height)
         lastOcrRequestAtMillis = now
+        Log.d(LOG_TAG, "ocr-request id=$requestId elapsedMillis=$now crop=$rect fingerprint=${java.lang.Long.toHexString(fingerprint)}")
         runCatching {
             submitTextRead(crop) { text ->
-                synchronized(this) {
-                    ocrCache.complete(requestId, text, android.os.SystemClock.elapsedRealtime())
+                val completedAt = android.os.SystemClock.elapsedRealtime()
+                val applied = synchronized(this) {
+                    ocrCache.complete(requestId, text, completedAt)
                 }
+                Log.d(LOG_TAG, "ocr-result id=$requestId applied=$applied elapsedMillis=$completedAt durationMillis=${completedAt - now} textLength=${text?.trim()?.length ?: 0}")
                 if (!crop.isRecycled) crop.recycle()
             }
         }.onFailure {
+            Log.w(LOG_TAG, "ocr-request-failed id=$requestId", it)
             ocrCache.complete(requestId, null, android.os.SystemClock.elapsedRealtime())
             if (!crop.isRecycled) crop.recycle()
         }
+        return true
     }
 
     /** A poor first OCR read must never pin a static event page forever. */
-    private fun retryOcr(bitmap: Bitmap, rect: EntryPixelRect, fingerprint: Long) {
+    private fun retryOcr(bitmap: Bitmap, rect: EntryPixelRect, fingerprint: Long): Boolean {
         val now = android.os.SystemClock.elapsedRealtime()
         if (lastOcrRequestAtMillis != Long.MIN_VALUE &&
             now - lastOcrRequestAtMillis < MIN_OCR_RETRY_INTERVAL_MILLIS
-        ) return
-        schedule(bitmap, rect, fingerprint)
+        ) return false
+        return schedule(bitmap, rect, fingerprint)
     }
 
     private fun enabledButtonConfidence(bitmap: Bitmap, rect: EntryPixelRect): Double =
@@ -247,5 +282,7 @@ class AndroidLabyrinthEventChoiceResolver(
         const val HASH_ROWS = 8
         const val MINIMUM_EVENT_BUTTON_CANDIDATE = 0.12
         const val MIN_OCR_RETRY_INTERVAL_MILLIS = 1_500L
+        const val MAX_DIAGNOSTIC_TEXT_LENGTH = 2_000
+        const val LOG_TAG = "LabyrinthEventOcr"
     }
 }

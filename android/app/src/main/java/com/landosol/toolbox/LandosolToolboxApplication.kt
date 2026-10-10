@@ -197,6 +197,7 @@ class LandosolToolboxApplication : Application() {
     private val labyrinthDebugDashboard by lazy {
         LabyrinthDebugDashboardServer(
             frameArchiveDirectory = java.io.File(cacheDir, "labyrinth-frame-archive"),
+            runtimeDiagnostics = com.landosol.toolbox.labyrinth.debug.LabyrinthRuntimeDiagnostics(this),
         ).also { server ->
             server.start()
         }

@@ -21,7 +21,9 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.Parcelable
+import android.os.SystemClock
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.Display
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
@@ -112,11 +114,22 @@ class MediaProjectionCaptureService : Service() {
                 ?: error("系统未返回屏幕投影")
             projection = mediaProjection
             captureStartedAt = System.currentTimeMillis()
+            Log.i("LandosolCapture", "projection-start sdk=${Build.VERSION.SDK_INT} elapsedMillis=${SystemClock.elapsedRealtime()}")
             val thread = HandlerThread("landosol-capture").also { it.start() }
             frameThread = thread
             val projectionCallback = object : MediaProjection.Callback() {
                 override fun onStop() {
+                    // Android provides no reason argument; do not infer a specific user action.
+                    Log.w("LandosolCapture", "projection-onStop elapsedMillis=${SystemClock.elapsedRealtime()} captureStartedAt=$captureStartedAt")
                     stopCapture("系统撤销屏幕捕获授权")
+                }
+
+                override fun onCapturedContentResize(width: Int, height: Int) {
+                    Log.i("LandosolCapture", "projection-content-resize width=$width height=$height elapsedMillis=${SystemClock.elapsedRealtime()}")
+                }
+
+                override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+                    Log.i("LandosolCapture", "projection-content-visibility visible=$isVisible elapsedMillis=${SystemClock.elapsedRealtime()}")
                 }
             }
             callback = projectionCallback
@@ -197,6 +210,7 @@ class MediaProjectionCaptureService : Service() {
             val width = metrics.width
             val height = metrics.height
             val density = metrics.densityDpi
+            Log.i("LandosolCapture", "configure-display width=$width height=$height densityDpi=$density flags=${captureDisplayFlags()} elapsedMillis=${SystemClock.elapsedRealtime()}")
             require(width > 0 && height > 0) { "系统返回了无效的屏幕尺寸" }
 
             val handler = Handler(thread.looper)
@@ -328,6 +342,9 @@ class MediaProjectionCaptureService : Service() {
         val hadResources: Boolean
         synchronized(captureLock) {
             hadResources = projection != null || virtualDisplay != null || imageReader != null
+            Log.w("LandosolCapture", "capture-stop reason=$reason hadResources=$hadResources " +
+                "elapsedMillis=${SystemClock.elapsedRealtime()} captureStartedAt=$captureStartedAt " +
+                "reader=${imageReader?.width}x${imageReader?.height}")
             imageReader?.setOnImageAvailableListener(null, null)
             imageReader?.close()
             imageReader = null

@@ -6,6 +6,7 @@ import android.graphics.Path
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
@@ -14,6 +15,7 @@ import com.landosol.toolbox.automation.AutomationActionBackend
 import com.landosol.toolbox.automation.AutomationBackendResult
 import com.landosol.toolbox.automation.capture.CaptureStateRegistry
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -58,6 +60,7 @@ class LandosolAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         activeService = this
         AccessibilityConnectionRegistry.update(true)
+        Log.i(GESTURE_LOG_TAG, "accessibility-connected uptimeMillis=${SystemClock.elapsedRealtime()} sdk=${Build.VERSION.SDK_INT}")
         refreshForegroundPackageFromRoot()
     }
 
@@ -90,9 +93,12 @@ class LandosolAccessibilityService : AccessibilityService() {
         return packageFromRoot
     }
 
-    override fun onInterrupt() = Unit
+    override fun onInterrupt() {
+        Log.w(GESTURE_LOG_TAG, "accessibility-interrupted connected=${isConnected()} uptimeMillis=${SystemClock.elapsedRealtime()}")
+    }
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
+        Log.w(GESTURE_LOG_TAG, "accessibility-unbound uptimeMillis=${SystemClock.elapsedRealtime()}")
         if (activeService === this) {
             activeService = null
             foregroundPackageName = null
@@ -103,6 +109,7 @@ class LandosolAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        Log.w(GESTURE_LOG_TAG, "accessibility-destroyed uptimeMillis=${SystemClock.elapsedRealtime()}")
         if (activeService === this) {
             activeService = null
             foregroundPackageName = null
@@ -122,6 +129,7 @@ class LandosolAccessibilityService : AccessibilityService() {
                 path = Path().apply { moveTo(action.point.x, action.point.y) },
                 durationMillis = TAP_DURATION_MILLIS,
                 displayId = gestureDisplayId,
+                description = "tap x=${action.point.x} y=${action.point.y}",
             )
         }
         is AutomationAction.Swipe -> {
@@ -141,6 +149,7 @@ class LandosolAccessibilityService : AccessibilityService() {
                     holdMillis = hold,
                     holdX = action.end.x,
                     holdY = action.end.y,
+                    description = "swipe from=${action.start.x},${action.start.y} to=${action.end.x},${action.end.y}",
                 )
             }
         }
@@ -162,10 +171,18 @@ class LandosolAccessibilityService : AccessibilityService() {
         holdMillis: Long = 0L,
         holdX: Float = 0f,
         holdY: Float = 0f,
+        description: String = "gesture",
+        gestureId: Long = gestureSequence.incrementAndGet(),
+        queuedAtMillis: Long = SystemClock.elapsedRealtime(),
     ): AutomationBackendResult = withTimeoutOrNull(durationMillis + holdMillis + GESTURE_CALLBACK_GRACE_MILLIS) {
         suspendCancellableCoroutine { continuation ->
             mainHandler.post {
                 if (!continuation.isActive) return@post
+                val dispatchedAt = SystemClock.elapsedRealtime()
+                Log.i(GESTURE_LOG_TAG, "gesture-dispatch id=$gestureId $description display=$displayId " +
+                    "explicitDisplay=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && displayId != Display.DEFAULT_DISPLAY} " +
+                    "queueMillis=${dispatchedAt - queuedAtMillis} durationMillis=$durationMillis holdMillis=$holdMillis " +
+                    "connected=${isConnected()} foreground=$foregroundPackageName activity=$foregroundActivityName")
                 // A drag that lifts at travel speed is read by the game as a fling and the
                 // map keeps sliding well past the gesture. Continue the same stroke with a
                 // 1 px, holdMillis-long tail so the velocity tracker samples ~0 before the
@@ -202,14 +219,14 @@ class LandosolAccessibilityService : AccessibilityService() {
                     gesture,
                     object : GestureResultCallback() {
                         override fun onCompleted(gestureDescription: GestureDescription?) {
-                            Log.i(GESTURE_LOG_TAG, "手势完成 display=$displayId duration=${durationMillis}ms")
+                            Log.i(GESTURE_LOG_TAG, "手势完成 display=$displayId duration=${durationMillis}ms id=$gestureId callbackMillis=${SystemClock.elapsedRealtime() - dispatchedAt}")
                             pending.getAndSet(null)?.let {
                                 if (it.isActive) it.resume(AutomationBackendResult.Completed)
                             }
                         }
 
                         override fun onCancelled(gestureDescription: GestureDescription?) {
-                            Log.w(GESTURE_LOG_TAG, "手势取消 display=$displayId duration=${durationMillis}ms")
+                            Log.w(GESTURE_LOG_TAG, "手势取消 display=$displayId duration=${durationMillis}ms id=$gestureId callbackMillis=${SystemClock.elapsedRealtime() - dispatchedAt}")
                             pending.getAndSet(null)?.let {
                                 if (it.isActive) {
                                     it.resume(
@@ -225,7 +242,7 @@ class LandosolAccessibilityService : AccessibilityService() {
                 )
                 if (!accepted && continuation.isActive) {
                     pending.set(null)
-                    Log.w(GESTURE_LOG_TAG, "系统拒绝手势 display=$displayId duration=${durationMillis}ms")
+                    Log.w(GESTURE_LOG_TAG, "系统拒绝手势 display=$displayId duration=${durationMillis}ms id=$gestureId")
                     continuation.resume(
                         AutomationBackendResult.Rejected(
                             "系统拒绝显示器 $displayId 的无障碍手势",
@@ -234,7 +251,10 @@ class LandosolAccessibilityService : AccessibilityService() {
                 }
             }
         }
-    } ?: AutomationBackendResult.Rejected("显示器 $displayId 的无障碍手势回调超时")
+    } ?: run {
+        Log.w(GESTURE_LOG_TAG, "gesture-timeout id=$gestureId display=$displayId elapsedMillis=${SystemClock.elapsedRealtime() - queuedAtMillis}")
+        AutomationBackendResult.Rejected("显示器 $displayId 的无障碍手势回调超时")
+    }
 
     private suspend fun onMainThread(action: () -> AutomationBackendResult): AutomationBackendResult =
         suspendCancellableCoroutine { continuation ->
@@ -254,6 +274,7 @@ class LandosolAccessibilityService : AccessibilityService() {
         private const val SWIPE_Y_START = 900f
         private const val SWIPE_Y_END = 300f
         private val mainHandler = Handler(Looper.getMainLooper())
+        private val gestureSequence = AtomicLong(0L)
 
         @Volatile
         private var activeService: LandosolAccessibilityService? = null
@@ -267,6 +288,8 @@ class LandosolAccessibilityService : AccessibilityService() {
 
         internal fun current(): LandosolAccessibilityService? = activeService
         fun isConnected(): Boolean = activeService != null && AccessibilityConnectionRegistry.isConnected()
+        /** Diagnostic sampling must not query or modify the active accessibility window. */
+        internal fun observedForegroundPackage(): String? = foregroundPackageName
         internal fun foregroundPackage(): String? {
             activeService?.refreshForegroundPackageFromRoot()
             return foregroundPackageName

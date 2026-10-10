@@ -5,6 +5,8 @@ import android.util.Log
 import com.landosol.toolbox.AppVersion
 import com.landosol.toolbox.automation.overlay.AutomationOverlayPresentation
 import com.landosol.toolbox.labyrinth.LabyrinthEntryRecognitionSessionState
+import com.landosol.toolbox.labyrinth.LabyrinthEventChoiceDecision
+import com.landosol.toolbox.labyrinth.vision.EntryPixelRect
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryFrameResult
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -36,6 +38,7 @@ class LabyrinthDebugDashboardServer(
     private val port: Int = DEFAULT_PORT,
     /** Directory for the optional per-frame archive; null disables the feature entirely. */
     private val frameArchiveDirectory: File? = null,
+    private val runtimeDiagnostics: LabyrinthRuntimeDiagnostics? = null,
 ) {
     private data class Snapshot(
         val json: ByteArray,
@@ -81,6 +84,7 @@ class LabyrinthDebugDashboardServer(
             return
         }
         Log.i(LOG_TAG, "debug dashboard listening on http://$IPV4_LOOPBACK:$port/")
+        runtimeDiagnostics?.start()
         Thread({ runServer(server) }, "labyrinth-debug-dashboard").apply {
             isDaemon = true
             start()
@@ -309,6 +313,8 @@ class LabyrinthDebugDashboardServer(
                     appendLine("应用版本: ${AppVersion.label}")
                     appendLine("生成时间: ${System.currentTimeMillis()}")
                     appendLine("服务地址: http://$IPV4_LOOPBACK:$port/")
+                    appendLine("environment.json: 导出时的 Android 版本、设备、显示器、DPI、权限与运行状态")
+                    appendLine("runtime/history.ndjson: 每 10 秒后台采样的进程 CPU/内存与捕获状态，最多保留约 1 小时；不包含电脑端负载")
                     appendLine("state/latest.json: 下载瞬间的结构化识别状态")
                     appendLine("state/history.ndjson: 最近 ${history.size} 条结构化状态历史")
                     appendLine(
@@ -323,6 +329,10 @@ class LabyrinthDebugDashboardServer(
                 }.toByteArray(Charsets.UTF_8),
             )
             entry("state/latest.json", snapshot.json)
+            runtimeDiagnostics?.let { diagnostics ->
+                entry("environment.json", diagnostics.environmentJson())
+                entry("runtime/history.ndjson", diagnostics.historyNdjson())
+            }
             entry(
                 "state/history.ndjson",
                 history.fold(ByteArrayOutputStream()) { output, json ->
@@ -389,6 +399,7 @@ class LabyrinthDebugDashboardServer(
         put("appVersion", AppVersion.name)
         put("appVersionCode", AppVersion.code)
         put("timestamp", nowMillis)
+        put("elapsedRealtimeMillis", android.os.SystemClock.elapsedRealtime())
         put("frameVersion", frameVersion)
         // The stored JPEG is refreshed at most every JPEG_REFRESH_INTERVAL_MILLIS, so several
         // consecutive rows share one picture and only the first of them was actually taken from
@@ -406,6 +417,80 @@ class LabyrinthDebugDashboardServer(
         put("page", result.observation.state.name)
         put("pageConfidence", result.observation.confidence)
         put("pageReason", result.observation.reason ?: JSONObject.NULL)
+        fun rectJson(rect: EntryPixelRect?): Any = rect?.let {
+            JSONObject().apply {
+                put("left", it.left)
+                put("top", it.top)
+                put("width", it.width)
+                put("height", it.height)
+            }
+        } ?: JSONObject.NULL
+        put("eventOcr", result.eventOcrDiagnostics?.let { diagnostic ->
+            JSONObject().apply {
+                put("status", diagnostic.status)
+                put("crop", rectJson(diagnostic.cropRect))
+                put("fingerprint", diagnostic.fingerprint ?: JSONObject.NULL)
+                put("completeLayoutCount", diagnostic.completeLayoutCount ?: JSONObject.NULL)
+                put("buttonConfidencesByOptionCount", JSONObject().apply {
+                    diagnostic.buttonConfidencesByOptionCount.forEach { (count, scores) ->
+                        put(count.toString(), JSONArray(scores))
+                    }
+                })
+                put("requestScheduled", diagnostic.requestScheduled)
+                put("rawText", diagnostic.rawText ?: JSONObject.NULL)
+                put("candidateEventId", diagnostic.candidateEventId ?: JSONObject.NULL)
+                put("candidateScore", diagnostic.candidateScore ?: JSONObject.NULL)
+                put("rivalMargin", diagnostic.rivalMargin ?: JSONObject.NULL)
+                put("stableFrames", diagnostic.stableFrames)
+                put("trusted", diagnostic.trusted)
+                put("cache", diagnostic.cache?.let { cache -> JSONObject().apply {
+                    put("status", cache.status)
+                    put("ageMillis", cache.ageMillis ?: JSONObject.NULL)
+                    put("lifetimeMillis", cache.cacheLifetimeMillis)
+                    put("fingerprintDistance", cache.fingerprintDistance ?: JSONObject.NULL)
+                    put("cachedCrop", rectJson(cache.cachedCropRect))
+                    put("cachedRequestId", cache.cachedRequestId ?: JSONObject.NULL)
+                    put("pendingRequestId", cache.pendingRequestId ?: JSONObject.NULL)
+                    put("pendingAgeMillis", cache.pendingAgeMillis ?: JSONObject.NULL)
+                    put("lastCompletedRequestId", cache.lastCompletedRequestId ?: JSONObject.NULL)
+                    put("lastRequestDurationMillis", cache.lastRequestDurationMillis ?: JSONObject.NULL)
+                    put("lastResultTextLength", cache.lastResultTextLength ?: JSONObject.NULL)
+                    put("lastResultStatus", cache.lastResultStatus ?: JSONObject.NULL)
+                } } ?: JSONObject.NULL)
+            }
+        } ?: JSONObject.NULL)
+        put("eventChoice", result.eventChoiceSelection?.let { event -> JSONObject().apply {
+            put("eventId", event.event.id)
+            put("optionCount", event.choices.size)
+            put("trusted", event.trusted)
+            put("choices", JSONArray().apply {
+                event.choices.forEach { visual -> put(JSONObject().apply {
+                    put("choiceId", visual.choice.id)
+                    put("slot", visual.choice.slot)
+                    put("label", visual.choice.name)
+                    put("conditionType", visual.choice.conditionType)
+                    put("conditionValue", visual.choice.conditionValue)
+                    put("button", rectJson(visual.buttonRect))
+                    put("buttonConfidence", visual.buttonConfidence)
+                    put("enabledConfidence", visual.enabledConfidence)
+                }) }
+            })
+        } } ?: JSONObject.NULL)
+        put("eventChoiceDecision", when (val decision = state.eventChoiceDecision) {
+            is LabyrinthEventChoiceDecision.Select -> JSONObject().apply {
+                put("type", "SELECT")
+                put("eventId", decision.eventId)
+                put("choiceId", decision.choiceId)
+                put("button", rectJson(decision.buttonRect))
+                put("actionSafe", decision.actionSafe)
+                put("safetyNote", decision.safetyNote ?: JSONObject.NULL)
+            }
+            is LabyrinthEventChoiceDecision.Wait -> JSONObject().apply {
+                put("type", "WAIT")
+                put("reason", decision.reason)
+            }
+            null -> JSONObject.NULL
+        })
         put("elapsedMillis", result.elapsedMillis)
         put("stageMillis", JSONObject(result.stageMillis))
         put("nodeSearchMode", result.nodeSearchMode)
