@@ -38,15 +38,18 @@ internal class LabyrinthBattleWaitPolicy {
             // the battle deadline through that transient state so the following UNKNOWN frames
             // remain under battle waiting instead of reaching the generic 30-second stop.
             LabyrinthEntryPageState.BATTLE_RESULT -> !battleResultNextReady
-            // Permit a short stale editor frame after injection, but do not hide a failed start.
-            LabyrinthEntryPageState.BATTLE_TEAM_SELECTION -> startPageGrace && elapsed < 3_000L
+            // Permit a short stale editor/challenge frame after injection, but do not hide a failed start.
+            LabyrinthEntryPageState.BATTLE_TEAM_SELECTION,
+            LabyrinthEntryPageState.BATTLE_CHALLENGE -> startPageGrace && elapsed < 3_000L
             else -> false
         }
         if (!waitingPage) {
             reset()
             return LabyrinthBattleWaitDecision.NONE
         }
-        if (page != LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) startPageGrace = false
+        if (page != LabyrinthEntryPageState.BATTLE_TEAM_SELECTION &&
+            page != LabyrinthEntryPageState.BATTLE_CHALLENGE
+        ) startPageGrace = false
         return if (elapsed >= 300_000L) LabyrinthBattleWaitDecision.TIMED_OUT
         else LabyrinthBattleWaitDecision.WAIT
     }
