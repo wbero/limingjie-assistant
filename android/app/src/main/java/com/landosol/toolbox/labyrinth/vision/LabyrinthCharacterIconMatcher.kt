@@ -84,17 +84,17 @@ class LabyrinthCharacterIconMatcher(
      * luminance and a local gradient (four more luminance lookups) from one pixel. Two of the three
      * inputs to that work are constant:
      *
-     *  - the pack-icon side depends only on the template and the grid, and a template never changes;
+     *  - the pack-icon side depends only on the template and the grid, and a template never changes,
+     *    so it is cached in [templateSamples] for the lifetime of the matcher;
      *  - the observed side depends only on the comparison rectangle and the mask, and the pack ships
      *    icons of a single size, so every candidate inside one [match] reads the very same pixels of
-     *    the same frame.
+     *    the same frame. That side is sampled once at the top of [match] and passed down as locals,
+     *    so no field ever retains the whole-frame [PixelImage] after [match] returns.
      *
      * Deriving each value once instead of once per candidate removes about 1.2 million luminance
-     * conversions per [match] on the real pack. Every cached number is the same pure function of the
-     * same pixels and the correlation inputs are still filled in the original order, so the scores
-     * stay bit-identical.
-     *
-     * Same single-frame-at-a-time assumption as the buffers above.
+     * conversions per [match] on the real pack. Every sampled number is the same pure function of
+     * the same pixels and the correlation inputs are still filled in the original order, so the
+     * scores stay bit-identical.
      */
     private class GridSamples(gridSize: Int) {
         val color = Array(3) { DoubleArray(gridSize) }
@@ -102,25 +102,17 @@ class LabyrinthCharacterIconMatcher(
         val gradient = DoubleArray(gridSize)
     }
 
-    /** Pack-icon samples, one entry per template, built once because a template never changes. */
+    /**
+     * Pack-icon samples, one entry per template, built lazily and kept for the lifetime of the
+     * matcher because a template never changes.
+     *
+     * Memory cost: 795 templates × 5 DoubleArray(240) × 8 B ≈ 7.3 MiB of array payload, plus the
+     * per-entry [GridSamples] objects and the [IdentityHashMap] overhead. This is a deliberate
+     * trade-off for skipping roughly 1.2 million luminance conversions per [match]; it is bounded
+     * by the icon pack size and does not grow with the number of frames processed.
+     */
     private val templateSamples =
         IdentityHashMap<LabyrinthBattleCharacterTemplate, GridSamples>()
-
-    /**
-     * Observed-side samples of the most recent call. The pack ships icons of one size, so every
-     * candidate inside one [match] reads the same pixels of the same frame; the frame is compared by
-     * reference, so samples can never be served for a different frame.
-     */
-    private var coarseObservedFrame: PixelImage? = null
-    private var coarseObservedTarget: EntryPixelRect? = null
-    private var coarseObservedMask: LabyrinthCharacterIconMask? = null
-    private var coarseObservedSamples: GridSamples? = null
-
-    /** Same for the scoring pass, which additionally carries luminance and gradient. */
-    private var scoreObservedFrame: PixelImage? = null
-    private var scoreObservedTarget: EntryPixelRect? = null
-    private var scoreObservedMask: LabyrinthCharacterIconMask? = null
-    private var scoreObservedSamples: GridSamples? = null
 
     /**
      * @param rosterCharacterIds the characters that can actually appear here, or null for any.
@@ -154,8 +146,27 @@ class LabyrinthCharacterIconMatcher(
                 template.attribute == null || template.attribute == requiredAttribute
             }
         }
+        // Sample the frame side once for this call. Every candidate shares the same comparison
+        // rectangle (the pack ships icons of a single size), so these grids are shared across all
+        // candidates. They stay locals, so the whole-frame PixelImage is released as soon as match()
+        // returns instead of being retained in a field.
+        val observedTarget = candidateTemplates.firstOrNull()
+            ?.let { comparisonRect(frame, iconRect, it.image) }
+        val coarseObserved = observedTarget?.let {
+            fillObservedSamples(frame, it, mask, COARSE_SAMPLE_WIDTH, COARSE_SAMPLE_HEIGHT)
+        }
+        val scoreObserved = observedTarget?.let {
+            fillObservedSamples(
+                frame = frame,
+                target = it,
+                mask = mask,
+                sampleWidth = SCORE_SAMPLE_WIDTH,
+                sampleHeight = SCORE_SAMPLE_HEIGHT,
+                withLuminanceAndGradient = true,
+            )
+        }
         val coarse = candidateTemplates
-            .map { template -> template to coarseIconScore(frame, iconRect, template, mask) }
+            .map { template -> template to coarseIconScore(template, mask, coarseObserved) }
             .sortedByDescending { (_, score) -> score }
         // The coarse pass is cheap and still sees the whole pack, so it can answer whether the
         // roster is trustworthy before the expensive pass commits to it.
@@ -171,7 +182,7 @@ class LabyrinthCharacterIconMatcher(
         val ranked = considered
             .filterIndexed { index, (_, score) -> index < MIN_ICON_CANDIDATES || score >= coarseCutoff }
             .take(MAX_ICON_CANDIDATES)
-            .map { (template, _) -> template to iconScore(frame, iconRect, template, mask) }
+            .map { (template, _) -> template to iconScore(template, mask, scoreObserved) }
             .sortedByDescending { (_, score) -> score }
         // Keep only the strongest icon variant for each logical character. A character can have
         // multiple star/rarity icon variants and those variants must never compete with each other
@@ -291,17 +302,17 @@ class LabyrinthCharacterIconMatcher(
     }
 
     private fun coarseIconScore(
-        frame: PixelImage,
-        iconRect: EntryPixelRect,
         template: LabyrinthBattleCharacterTemplate,
         mask: LabyrinthCharacterIconMask,
+        observed: GridSamples?,
     ): Double {
-        val target = comparisonRect(frame, iconRect, template.image) ?: return 0.0
+        // observed is null only when the comparison rectangle does not exist for this frame and
+        // rectangle (the pack ships icons of a single size, so the rectangle is shared by every
+        // candidate and was sampled once up in [match]).
+        if (observed == null) return 0.0
         val sampleWidth = COARSE_SAMPLE_WIDTH
         val sampleHeight = COARSE_SAMPLE_HEIGHT
-        // The observed grid is shared by every candidate in this match(), so it is computed once
-        // here and only the pack side is filled per candidate below.
-        val observed = coarseObservedSamplesOf(frame, target, mask).color
+        val observedColor = observed.color
         val expected = coarseExpectedScratch
         var count = 0
         repeat(sampleHeight) { sampleY ->
@@ -320,20 +331,19 @@ class LabyrinthCharacterIconMatcher(
         }
         if (count < 8) return 0.0
         return (0..2).map { channel ->
-            correlation(observed[channel], expected[channel], count)
+            correlation(observedColor[channel], expected[channel], count)
         }.average().coerceAtLeast(0.0)
     }
 
     private fun iconScore(
-        frame: PixelImage,
-        iconRect: EntryPixelRect,
         template: LabyrinthBattleCharacterTemplate,
         mask: LabyrinthCharacterIconMask,
+        observed: GridSamples?,
     ): Double {
-        val target = comparisonRect(frame, iconRect, template.image) ?: return 0.0
-        // Observed side of the fine grid: same rectangle and mask for every candidate in this
-        // match(), and it additionally carries luminance and gradient.
-        val observed = scoreObservedSamplesOf(frame, target, mask)
+        // observed is null only when the comparison rectangle does not exist for this frame and
+        // rectangle (the pack ships icons of a single size, so the rectangle is shared by every
+        // candidate and was sampled once up in [match]).
+        if (observed == null) return 0.0
         // Pack side: a template never changes, so its grid is derived once per template and reused
         // for every candidate from then on, in this match() and in later ones.
         val expected = templateSamplesOf(template)
@@ -387,58 +397,6 @@ class LabyrinthCharacterIconMatcher(
             }
         }
         templateSamples[template] = samples
-        return samples
-    }
-
-    /** The observed side of the coarse grid for one frame, rectangle and mask. */
-    private fun coarseObservedSamplesOf(
-        frame: PixelImage,
-        target: EntryPixelRect,
-        mask: LabyrinthCharacterIconMask,
-    ): GridSamples {
-        val cached = coarseObservedSamples
-        if (cached != null &&
-            coarseObservedFrame === frame &&
-            coarseObservedTarget == target &&
-            coarseObservedMask == mask
-        ) {
-            return cached
-        }
-        val samples =
-            fillObservedSamples(frame, target, mask, COARSE_SAMPLE_WIDTH, COARSE_SAMPLE_HEIGHT)
-        coarseObservedFrame = frame
-        coarseObservedTarget = target
-        coarseObservedMask = mask
-        coarseObservedSamples = samples
-        return samples
-    }
-
-    /** The observed side of the scoring grid for one frame, rectangle and mask. */
-    private fun scoreObservedSamplesOf(
-        frame: PixelImage,
-        target: EntryPixelRect,
-        mask: LabyrinthCharacterIconMask,
-    ): GridSamples {
-        val cached = scoreObservedSamples
-        if (cached != null &&
-            scoreObservedFrame === frame &&
-            scoreObservedTarget == target &&
-            scoreObservedMask == mask
-        ) {
-            return cached
-        }
-        val samples = fillObservedSamples(
-            frame = frame,
-            target = target,
-            mask = mask,
-            sampleWidth = SCORE_SAMPLE_WIDTH,
-            sampleHeight = SCORE_SAMPLE_HEIGHT,
-            withLuminanceAndGradient = true,
-        )
-        scoreObservedFrame = frame
-        scoreObservedTarget = target
-        scoreObservedMask = mask
-        scoreObservedSamples = samples
         return samples
     }
 
