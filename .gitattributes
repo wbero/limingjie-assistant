@@ -9,3 +9,8 @@ gradlew text eol=lf
 *.webp binary
 *.xlsx binary
 
+
+# Verbatim test baselines. The golden harness compares this file's text against a string built with
+# "\n" separators, so a CRLF working copy would make the comparison fail -- the same reason gradlew
+# is pinned above. Keep it byte-verbatim.
+android/app/src/test/resources/*-golden.txt text eol=lf
