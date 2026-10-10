@@ -767,7 +767,7 @@ class LabyrinthTeamScorer(
         val sustainScore = effectiveSustainScore(sustainAnchor)
         val hasReliableFrontline = frontlineScore >= config.minimumReliableVanguard
         val hasEffectiveSustain = sustainScore >= config.minimumEffectiveSustain
-        val relevantReduction = when (context.enemyDamageType) {
+        val relevantReduction = when (context.effectiveEnemyDamageType) {
             LabyrinthEnemyDamageType.PHYSICAL -> members.maxOf { it.functions.physicalAttackReduction.orZero() }
             LabyrinthEnemyDamageType.MAGIC -> members.maxOf { it.functions.magicAttackReduction.orZero() }
             LabyrinthEnemyDamageType.MIXED -> (
@@ -941,6 +941,7 @@ class LabyrinthTeamScorer(
             "遭遇攻略偏好" to preferredCapabilityBonus,
         )
         val reasons = if (!explain) emptyList() else buildList {
+            labyrinthEncounterFormationReason(members, context)?.let(::add)
             if (duplicates > 0) {
                 add("重复纯职能：纯坦${pureTankCount}名、纯治疗${pureHealerCount}名；扣${duplicatePenalty}分" +
                     if (context.survivalRecovery || survivalNeedsHelp) "（生存不足或失败后兜底，扣分减半）" else "")
@@ -1163,7 +1164,7 @@ internal fun LabyrinthRoleProfile.labyrinthVanguardStrength(context: LabyrinthRo
     }
     if (profile.requiresAllyInFront) return 0.0
 
-    val panelDurability = when (context.enemyDamageType) {
+    val panelDurability = when (context.effectiveEnemyDamageType) {
         LabyrinthEnemyDamageType.PHYSICAL -> profile.physicalDurability.orZero()
         LabyrinthEnemyDamageType.MAGIC -> profile.magicDurability.orZero()
         LabyrinthEnemyDamageType.MIXED -> (
@@ -1181,7 +1182,7 @@ internal fun LabyrinthRoleProfile.labyrinthVanguardStrength(context: LabyrinthRo
             support.universalSurvival.orZero() * 0.05
         ).coerceIn(0.0, 100.0)
 
-    val evasion = when (context.enemyDamageType) {
+    val evasion = when (context.effectiveEnemyDamageType) {
         LabyrinthEnemyDamageType.PHYSICAL -> profile.physicalEvasion.orZero()
         LabyrinthEnemyDamageType.MAGIC -> profile.magicEvasion.orZero()
         LabyrinthEnemyDamageType.MIXED -> minOf(
@@ -1269,7 +1270,7 @@ class LabyrinthTeamOptimizer(
         if (requiredIds.isEmpty()) return bestBattleFormation(roster, context)
         val unique = roster.distinctBy(LabyrinthRoleProfile::characterId)
         if (!requiredIds.all { id -> unique.any { it.characterId == id } }) return null
-        if (context.preferSingleDamageSystem) {
+        if (context.preferSingleDamageSystem && context.encounterStrategy?.vanguardIsolationRadius == null) {
             val cohesive = rankedFormationsInternal(
                 roster = unique, context = context, requiredCharacterId = null, systemOnly = false,
                 limit = 1, requireFrontmostTank = true, forbidMixedDamageSystem = true,
@@ -1287,7 +1288,7 @@ class LabyrinthTeamOptimizer(
         roster: Collection<LabyrinthRoleProfile>,
         context: LabyrinthRoleDecisionContext,
     ): LabyrinthTeamEvaluation? {
-        if (context.preferSingleDamageSystem) {
+        if (context.preferSingleDamageSystem && context.encounterStrategy?.vanguardIsolationRadius == null) {
             val cohesive = rankedFormationsInternal(
                 roster = roster,
                 context = context,
@@ -1398,7 +1399,8 @@ class LabyrinthTeamOptimizer(
         val size = minOf(TEAM_SIZE, searchPool.size)
         // Worst candidate first. For equal scores keep the earlier enumeration, exactly like
         // the old stable full sort, without retaining tens of thousands of evaluations.
-        val order = compareBy<RankedCandidate> { it.score }.thenByDescending { it.ordinal }
+        val order = compareByDescending<RankedCandidate> { it.formationRisk }
+            .thenBy { it.score }.thenByDescending { it.ordinal }
         val comboCount = binomialCount(searchPool.size, size)
         val filter = CombinationFilter(
             context = context,
@@ -1443,13 +1445,14 @@ class LabyrinthTeamOptimizer(
                 return null
             }
             val score = if (systemOnly) evaluation.systemScore else evaluation.score
-            return RankedCandidate(evaluation.members, score, ordinal)
+            return RankedCandidate(evaluation.members, score, ordinal,
+                labyrinthEncounterFormationRisk(team, context))
         }
     }
 
     private fun offer(best: PriorityQueue<RankedCandidate>, candidate: RankedCandidate, limit: Int) {
         val worst = best.peek()
-        if (best.size < limit || (worst != null && candidate.score.compareTo(worst.score) > 0)) {
+        if (best.size < limit || (worst != null && requireNotNull(best.comparator()).compare(candidate, worst) > 0)) {
             if (best.size == limit) best.poll()
             best.add(candidate)
         }
@@ -1556,7 +1559,9 @@ class LabyrinthTeamOptimizer(
                     (role.isEligibleBattleVanguard(context, gate) ||
                         requireNotNull(role.position) > tankPosition)
             }
-            .sortedByDescending { individualSearchPriority(it, context) }
+            .sortedWith(compareBy<LabyrinthRoleProfile> {
+                labyrinthEncounterFormationRisk(listOf(frontmostTank, it), context)
+            }.thenByDescending { individualSearchPriority(it, context) })
             .take(teamSize - 1)
             .toList()
         if (compatible.size != teamSize - 1) return emptyList()
@@ -1580,6 +1585,7 @@ class LabyrinthTeamOptimizer(
         val members: List<LabyrinthRoleProfile>,
         val score: Double,
         val ordinal: Long,
+        val formationRisk: Int,
     )
 
     private fun individualSearchPriority(role: LabyrinthRoleProfile, context: LabyrinthRoleDecisionContext): Double {
@@ -1966,8 +1972,15 @@ class LabyrinthTeamPlanSearcher(
         }
         val guideCore = labyrinthEncounterGuideCore(roster, context)
         val coreFirst = if (guideCore.isEmpty()) null else optimizer.bestBattleFormationIncluding(roster, context, guideCore)
-        val first = coreFirst
-            ?: optimizer.bestBattleFormation(roster, context)
+        val ordinary = if (coreFirst == null || context.encounterStrategy?.vanguardIsolationRadius != null) {
+            optimizer.bestBattleFormation(roster, context)
+        } else null
+        val chosenCore = coreFirst?.takeIf { core ->
+            ordinary == null || labyrinthEncounterFormationRisk(core.members, context) <=
+                labyrinthEncounterFormationRisk(ordinary.members, context)
+        }
+        val first = chosenCore
+            ?: ordinary
             // Nobody in this pool can lead. Refusing leaves the run with nothing to send and the
             // fight still has to be played, so compose the best team the pool allows and say
             // plainly that it leads without a qualified tank (2026-09-19, by request). Boss
@@ -1990,7 +2003,8 @@ class LabyrinthTeamPlanSearcher(
         }
         val coreNote = when {
             guideCore.isEmpty() -> ""
-            coreFirst != null -> "；已按攻略锁定核心角色：$coreNames"
+            chosenCore != null -> "；已按攻略锁定核心角色：$coreNames"
+            coreFirst != null -> "；有效效果核心与隔离前排冲突，优先减少近身队友"
             else -> "；攻略核心角色无法与合格一号位同队，退回普通最佳队"
         }
         return LabyrinthTeamPlan(
@@ -2234,6 +2248,13 @@ class LabyrinthTeamPlanSearcher(
             )
         }
         val first = ranked.first()
+        if (context.encounterStrategy?.vanguardIsolationRadius != null) {
+            return LabyrinthTeamPlan(
+                LabyrinthTeamPlanKind.FIRST_ATTEMPT_ONE_TEAM,
+                listOf(first),
+                "首战失败后按隔离前排策略选择未重复失败的队伍，评分${formatScore(first.score)}",
+            )
+        }
         if (first.score >= config.oneTeamKillScore) {
             return LabyrinthTeamPlan(
                 LabyrinthTeamPlanKind.ONE_TEAM_STABLE_KILL,
@@ -2418,7 +2439,13 @@ internal fun labyrinthEncounterGuideCore(
     return core.filter { id ->
         val role = unique.first { it.characterId == id }
         val position = role.position ?: return@filter false
-        eligibleTanks.any { tank -> tank.characterId == id || (tank.position ?: Int.MAX_VALUE) <= position }
+        eligibleTanks.any { tank ->
+            tank.characterId == id || if (strategy.vanguardIsolationRadius != null) {
+                role.roleClass != "掩护者" && position - (tank.position ?: Int.MAX_VALUE) > strategy.vanguardIsolationRadius
+            } else {
+                (tank.position ?: Int.MAX_VALUE) <= position
+            }
+        }
     }.take(ENCOUNTER_GUIDE_CORE_MAX).toSet()
 }
 

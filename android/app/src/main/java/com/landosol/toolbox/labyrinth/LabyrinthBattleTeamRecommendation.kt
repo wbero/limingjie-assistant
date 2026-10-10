@@ -197,7 +197,7 @@ class LabyrinthBattleTeamRecommendationPlanner(
         context: LabyrinthRoleDecisionContext,
         failedTeamSignatures: Set<String>,
         lastFailedTeamSignature: String,
-    ): LabyrinthBattleTeamRecommendationResult? {
+    ): LabyrinthBattleTeamRecommendationResult.Ready? {
         val failedIds = lastFailedTeamSignature
             .split(',')
             .map(String::trim)
@@ -312,6 +312,10 @@ class LabyrinthBattleTeamRecommendationPlanner(
         val retryPoolHasVanguard = resolved.any { it.isEligibleBattleVanguard(context) }
         val retrySupplementLead = allowSupplementLead || !retryPoolHasVanguard
 
+        val isolatedRetryPlan = if (context.encounterStrategy?.vanguardIsolationRadius != null) {
+            teamPlanSearcher.fallbackSearch(resolved, context, failedTeamSignatures)
+        } else null
+
         if (context.encounterStrategy != null && retryNumber >= 2 && lastFailedTeamSignature != null) {
             val recovery = exSecondFailureHealerRecovery(
                 roster = resolved,
@@ -319,10 +323,19 @@ class LabyrinthBattleTeamRecommendationPlanner(
                 failedTeamSignatures = failedTeamSignatures,
                 lastFailedTeamSignature = lastFailedTeamSignature,
             )
-            if (recovery != null) return recovery
-            // No healer swap is possible (no healer owned, or every swap already failed). Fall
-            // through to the ordinary fallback search instead of refusing: a retry with a
-            // different formation beats leaving the run parked on the failure page.
+            val recoveryRisk = recovery?.let { result ->
+                labyrinthEncounterFormationRisk(result.recommendation.members.map {
+                    knownProfiles.getValue(it.characterId)
+                }, context)
+            }
+            val bestRetryRisk = isolatedRetryPlan?.teams?.firstOrNull()?.let {
+                labyrinthEncounterFormationRisk(it.members, context)
+            }
+            if (recovery != null && (bestRetryRisk == null || requireNotNull(recoveryRisk) <= bestRetryRisk)) {
+                return recovery
+            }
+            // No unfailed healer swap is possible, or it puts more allies around the front
+            // than the best available retry. Fall through to the fallback search.
         }
 
         val plan = if (requestedBossTeamCount > 1 || allowSupplementLead) {
@@ -334,7 +347,7 @@ class LabyrinthBattleTeamRecommendationPlanner(
                 survivalRecovery = true,
             )
         } else {
-            teamPlanSearcher.fallbackSearch(
+            isolatedRetryPlan ?: teamPlanSearcher.fallbackSearch(
                 roster = resolved,
                 context = context,
                 excludedTeamSignatures = failedTeamSignatures,

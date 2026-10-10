@@ -97,12 +97,17 @@ data class LabyrinthExEncounterStrategy(
     /** Conditional alternatives, e.g. displacement when a wide-AOE core cannot fully cover. */
     val fallbackPreferences: List<LabyrinthEncounterFallbackPreference> = emptyList(),
     val preferEffectiveCharacters: Boolean = true,
+    /** Confirmed encounter damage type; UNKNOWN retains the generic survival model. */
+    val enemyDamageType: LabyrinthEnemyDamageType = LabyrinthEnemyDamageType.UNKNOWN,
+    /** Static starting-position heuristic; skills can move units after the battle starts. */
+    val vanguardIsolationRadius: Int? = null,
     val notes: List<String> = emptyList(),
 ) {
     init {
         require(id.isNotBlank())
         require(identityName.isNotBlank())
         require(targetCount >= 1)
+        require(vanguardIsolationRadius == null || vanguardIsolationRadius > 0)
         preferredCapabilityMemberTargets.forEach { (capability, count) ->
             require(capability in preferredCapabilities)
             require(count > 0)
@@ -118,6 +123,8 @@ object LabyrinthExEncounterCatalog {
             id = "ghost_lord",
             identityName = "幽灵领主",
             targetCount = 1,
+            enemyDamageType = LabyrinthEnemyDamageType.MAGIC,
+            vanguardIsolationRadius = 300,
             preferredCapabilities = setOf(LabyrinthEncounterCapability.HEAL),
             notes = listOf("攻略：1个坦克+4个后排，坦克与后排尽量拉开，降低以坦克为中心AOE波及"),
         ),
