@@ -52,7 +52,7 @@
 
 - 工程最低系统要求为 Android 8.0（API 26），不代表已验证所有符合版本要求的设备。
 - 已测试环境：**MuMu 模拟器，1920 × 1080**（B 服）；**雷电模拟器 9，1920 × 1080**（小米、华为、vivo 渠道服）。手机、其他模拟器、其他分辨率及宽高比均暂未验证。
-- 支持的服务器与游戏包名：国服 Bilibili `com.bilibili.priconne`；渠道服——小米 `.mi`、华为 `.huawei`、vivo `.vivo`、OPPO `.nearme.gamecenter`、九游 `.aligames`、4399 `.m4399`、MuMu `.yofun.mumu`（以上均为 `com.bilibili.priconne` 后缀），应用宝 `com.tencent.tmgp.bilibili.priconne`。实机验证过登录与运行的渠道服：小米、华为、vivo（雷电模拟器 9）；4399 可以登录，但被顶号后 4399 SDK 会弹出用户协议对话框，目前无法连续多局；OPPO、九游、MuMu、应用宝与小米共用同一渠道服网关，尚未实机验证。详见 `android/docs/channel-servers.md`。
+- 支持的服务器与游戏包名：国服 Bilibili `com.bilibili.priconne`；渠道服——小米 `.mi`、华为 `.huawei`、vivo `.vivo`、OPPO `.nearme.gamecenter`、九游 `.aligames`、4399 `.m4399`、MuMu `.yofun.mumu`（以上均为 `com.bilibili.priconne` 后缀），应用宝 `com.tencent.tmgp.bilibili.priconne`。实机验证过登录与运行的渠道服：小米、华为、vivo（雷电模拟器 9）；4399 可以登录；4399 用户协议 / 账号授权、九游登录历史这类渠道 SDK 界面在会话重置时按无障碍文字推进，vivo 等 SDK 临时转竖屏不再中断屏幕捕获（尚未实机验证连续多局）；OPPO、九游、MuMu、应用宝与小米共用同一渠道服网关，尚未实机验证。详见 `android/docs/channel-servers.md`。
 - 在账号库新增账号时选择服务器；助手操作的游戏客户端跟随当前选中账号，多个客户端并存时也能明确区分。编辑账号时也可以更换服务器，但必须同时重新填写密码，原有登录会话随之失效。
 - 渠道服不走 Bilibili SDK 登录：「登录账号」填 `uid`、「密码」填 `access_key`，直接登录渠道服游戏服务器。
 - 视觉资源以横屏 `1920 × 1080` 为主要参考尺寸，识别时进行坐标映射；其他分辨率、宽高比、遮挡和窗口裁切需要实际验证。

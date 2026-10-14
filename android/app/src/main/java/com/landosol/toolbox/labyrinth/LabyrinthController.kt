@@ -211,6 +211,14 @@ class LabyrinthController(
     private val loginCoordinatorProvider: () -> BilibiliNativeLoginCoordinator,
     private val settingsStore: LabyrinthRerollSettingsStore,
     private val launchForeground: () -> Unit,
+    /**
+     * Runs before a reroll logs in to the game server. Returns a failure message to abort the
+     * reroll, or null to go on. The application uses it to hard-close channel clients whose SDK
+     * logs out when the client is taken over (ChannelSdkTraits.closesClientBeforeReroll).
+     */
+    private val beforeRerollLogin: suspend () -> String? = { null },
+    /** Runs after a standalone (non-batch) reroll ends; the batch cold-starts the client itself. */
+    private val afterStandaloneReroll: suspend () -> Unit = {},
 ) {
     // 缺少国服游戏包时，首页构造本 Controller 不应触发 BilibiliSDK 的包查询。
     // 协调器改为按需解析：仅在登录/验证码等真实操作走到时才求值。
@@ -427,6 +435,7 @@ class LabyrinthController(
         val config = labyrinthBatchRerollConfig(base, guildId, difficulty)
         chrome.update { it.copy(isWorking = true, message = null, progress = "批量：正在刷取 $guildId", routeBlockIds = emptyList()) }
         try {
+            beforeRerollLogin()?.let { reason -> return failure(reason) }
             var sessionResets = 0
             while (true) {
                 val session = ensureGameSession(account, PendingLoginAction.START)
@@ -504,6 +513,11 @@ class LabyrinthController(
         if (account == null || account.id != accountId || account.id != settingsAccountId) {
             return com.landosol.toolbox.labyrinth.batch.LabyrinthBatchReusableOpeningCheck.Failure("当前账号已变化")
         }
+        // The explicit read that produced this opening already took the client's session; close
+        // the client before it can meet 6002, so the batch cold-starts it instead.
+        beforeRerollLogin()?.let { reason ->
+            return com.landosol.toolbox.labyrinth.batch.LabyrinthBatchReusableOpeningCheck.Failure(reason)
+        }
         val session = sessionRegistry.read(accountId)
             ?: return com.landosol.toolbox.labyrinth.batch.LabyrinthBatchReusableOpeningCheck.Failure(
                 "读取当前开局使用的登录会话已失效，请重新读取",
@@ -539,6 +553,10 @@ class LabyrinthController(
         runningJob = scope.launch {
             chrome.update { it.copy(isWorking = true, message = null, routeBlockIds = emptyList()) }
             try {
+                beforeRerollLogin()?.let { reason ->
+                    chrome.update { it.copy(message = reason) }
+                    return@launch
+                }
                 var sessionResets = 0
                 while (true) {
                     val session = ensureGameSession(account, PendingLoginAction.START) ?: return@launch
@@ -605,6 +623,10 @@ class LabyrinthController(
             } finally {
                 withContext(NonCancellable) { runCatching { refreshCheckpoint(account.id) } }
                 chrome.update { it.copy(isWorking = false, progress = null) }
+                // A captcha pause resumes this reroll later; the client stays closed until then.
+                if (chrome.value.captcha == null) {
+                    withContext(NonCancellable) { runCatching { afterStandaloneReroll() } }
+                }
                 if (chrome.value.captcha == null) frozenStart = null
                 runningJob = null
                 cancellationMessage = null

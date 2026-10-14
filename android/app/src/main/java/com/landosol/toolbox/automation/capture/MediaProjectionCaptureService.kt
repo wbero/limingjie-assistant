@@ -64,6 +64,7 @@ class MediaProjectionCaptureService : Service() {
     private var frameThread: HandlerThread? = null
     private var lastFrameAt = 0L
     private var captureStartedAt = 0L
+    private val rotationGate = CaptureTransientRotationGate()
     /** ImageReader buffers must not be closed while a callback is copying a frame. */
     private val captureLock = Any()
     /** Only ever touched inside [captureLock], one frame conversion at a time. */
@@ -176,24 +177,61 @@ class MediaProjectionCaptureService : Service() {
     private fun reconfigureDisplayIfNeeded() {
         val snapshot = synchronized(captureLock) { projection to frameThread }
         snapshot.first ?: return
-        snapshot.second ?: return
+        val thread = snapshot.second ?: return
         val metrics = currentDisplayMetrics()
         val readerSize = synchronized(captureLock) {
             imageReader?.let { reader -> reader.width to reader.height }
         } ?: return
-        if (readerSize.first == metrics.width && readerSize.second == metrics.height) return
-
-        // Android 14+ does not allow creating a second VirtualDisplay from the same projection
-        // token. Reusing the old display with resize()/setSurface() looks valid on AOSP, but MuMu
-        // can keep the old mirror transform and render the new landscape game into only one corner
-        // of the larger buffer. That produces a syntactically valid Bitmap which every downstream
-        // recognizer then reports as UNKNOWN. Fail closed instead: once the physical display size
-        // changes, require a fresh MediaProjection authorization while the game is already in its
-        // final orientation.
-        stopCapture(
-            "屏幕尺寸从${readerSize.first}x${readerSize.second}变为${metrics.width}x${metrics.height}，" +
-                "为避免投影画面缩在角落，请保持游戏当前方向并重新授权屏幕捕获",
+        applyRotationDecision(
+            rotationGate.observe(
+                captureWidth = readerSize.first,
+                captureHeight = readerSize.second,
+                displayWidth = metrics.width,
+                displayHeight = metrics.height,
+                nowMillis = System.currentTimeMillis(),
+                tolerateRotation = CaptureRotationPolicy.toleratesTransientRotation(),
+            ),
+            thread,
         )
+    }
+
+    /**
+     * Android 14+ does not allow creating a second VirtualDisplay from the same projection token.
+     * Reusing the old display with resize()/setSurface() looks valid on AOSP, but MuMu can keep the
+     * old mirror transform and render the new landscape game into only one corner of the larger
+     * buffer. That produces a syntactically valid Bitmap which every downstream recognizer then
+     * reports as UNKNOWN. So the capture surface is never resized: a lasting size change still
+     * requires a fresh MediaProjection authorization.
+     *
+     * A channel SDK login page is the exception. 2026-09-25 vivo diag: after 返回标题 the vivo SDK
+     * opened its portrait UnionActivity, logged in by itself and rotated back four seconds later,
+     * but the first portrait callback had already stopped capture, so the session reset sat in
+     * WAITING_LOGIN until the user re-authorised. 4399's 账号授权 page is portrait as well. While the
+     * display is only rotated, the untouched landscape VirtualDisplay keeps mirroring; its frames
+     * are dropped until the original orientation is back, and only then are frames delivered again.
+     */
+    private fun applyRotationDecision(decision: CaptureRotationDecision, thread: HandlerThread) {
+        when (decision) {
+            CaptureRotationDecision.Deliver,
+            CaptureRotationDecision.Settling,
+            CaptureRotationDecision.Suspended,
+            -> Unit
+            is CaptureRotationDecision.SuspensionStarted -> {
+                android.util.Log.w(
+                    LOG_TAG,
+                    "屏幕临时旋转为${decision.displayWidth}x${decision.displayHeight}，暂停投递画面，" +
+                        "等待恢复${decision.captureWidth}x${decision.captureHeight}" +
+                        "（最长${rotationGate.graceMillis / 1_000} 秒）",
+                )
+                Handler(thread.looper).postDelayed(
+                    { reconfigureDisplayIfNeeded() },
+                    rotationGate.graceMillis + ROTATION_RECHECK_SLACK_MILLIS,
+                )
+            }
+            CaptureRotationDecision.Resumed ->
+                android.util.Log.i(LOG_TAG, "屏幕方向已恢复，继续投递画面")
+            is CaptureRotationDecision.Stop -> stopCapture(decision.reason)
+        }
     }
 
     private fun postDisplayReconfiguration() {
@@ -248,6 +286,7 @@ class MediaProjectionCaptureService : Service() {
                 oldReader?.close()
             }
             lastFrameAt = 0L
+            rotationGate.reset()
             reader.setOnImageAvailableListener({ source -> onImageAvailable(source) }, handler)
             setState(
                 CaptureState.Running(
@@ -283,9 +322,28 @@ class MediaProjectionCaptureService : Service() {
         val now = System.currentTimeMillis()
         var bitmap: Bitmap? = null
         var conversionError: Throwable? = null
+        // Orientation is judged only for frames the interval would convert, so a rotated display
+        // costs one metrics read per FRAME_INTERVAL_MILLIS rather than one per mirrored frame.
+        val rotation = if (now - lastFrameAt < FRAME_INTERVAL_MILLIS) {
+            null
+        } else {
+            val metrics = currentDisplayMetrics()
+            rotationGate.observe(
+                captureWidth = source.width,
+                captureHeight = source.height,
+                displayWidth = metrics.width,
+                displayHeight = metrics.height,
+                nowMillis = now,
+                tolerateRotation = CaptureRotationPolicy.toleratesTransientRotation(),
+            ).also { decision -> frameThread?.let { thread -> applyRotationDecision(decision, thread) } }
+        }
         synchronized(captureLock) {
             val image = runCatching { source.acquireLatestImage() }.getOrNull() ?: return
-            if (now - lastFrameAt < FRAME_INTERVAL_MILLIS) {
+            if (rotation == null) {
+                runCatching { image.close() }
+            } else if (!rotation.deliversFrame) {
+                // A rotated mirror is letterboxed portrait content; never hand it to a recognizer.
+                lastFrameAt = now
                 runCatching { image.close() }
             } else {
                 lastFrameAt = now
@@ -405,6 +463,9 @@ class MediaProjectionCaptureService : Service() {
          */
         private const val FRAME_INTERVAL_MILLIS = 300L
         private const val INITIAL_DISPLAY_SAMPLE_INTERVAL_MILLIS = 100L
+        /** Lets the grace deadline pass before the re-check, so the gate is sure to have expired. */
+        private const val ROTATION_RECHECK_SLACK_MILLIS = 500L
+        private const val LOG_TAG = "LandosolCapture"
         // 公共镜像显示器会进入 Accessibility 的有效显示器集合；否则 MuMu 将游戏输入
         // 克隆到捕获显示器后，无障碍只能把手势发往不可触达游戏的默认显示器。
         private fun captureDisplayFlags(): Int =
@@ -467,6 +528,106 @@ internal class CaptureDisplayStabilityGate(
         return metrics.takeIf {
             metrics.width > metrics.height && stableSampleCount >= requiredStableSamples
         }
+    }
+}
+
+/**
+ * Whether a pure rotation of the display may be ridden out instead of stopping capture. Set by the
+ * application from the selected account's channel; off by default, which is upstream's behaviour.
+ */
+object CaptureRotationPolicy {
+    @Volatile
+    var toleratesTransientRotation: () -> Boolean = { false }
+}
+
+internal sealed interface CaptureRotationDecision {
+    /** Whether a frame observed with this decision may be handed to recognizers. */
+    val deliversFrame: Boolean get() = false
+
+    /** Display and capture surface agree; frames flow normally. */
+    data object Deliver : CaptureRotationDecision {
+        override val deliversFrame: Boolean get() = true
+    }
+
+    /** The display has just turned from the capture size to its transpose. */
+    data class SuspensionStarted(
+        val captureWidth: Int,
+        val captureHeight: Int,
+        val displayWidth: Int,
+        val displayHeight: Int,
+    ) : CaptureRotationDecision
+
+    /** Still rotated, inside the grace period. */
+    data object Suspended : CaptureRotationDecision
+
+    /** The original orientation is back; the next frames may still carry the rotation animation. */
+    data object Resumed : CaptureRotationDecision
+
+    /** Back for less than the settle period. */
+    data object Settling : CaptureRotationDecision
+
+    data class Stop(val reason: String) : CaptureRotationDecision
+}
+
+/**
+ * Decides what to do with frames while the default display differs from the capture surface.
+ *
+ * Only a pure rotation (display == transposed capture size) is tolerated, and only for
+ * [graceMillis]: a channel SDK login page turns the screen portrait for a few seconds and then
+ * hands the landscape game back. Any other size change, or a rotation that outlasts the grace
+ * period, keeps the old fail-closed behaviour and stops capture with the original message.
+ * Pure and single-threaded (the capture thread), so it is JVM-testable.
+ */
+internal class CaptureTransientRotationGate(
+    val graceMillis: Long = 120_000L,
+    private val settleMillis: Long = 1_000L,
+) {
+    private var suspendedSince = Long.MIN_VALUE
+    private var resumedAt = Long.MIN_VALUE
+
+    init {
+        require(graceMillis > 0)
+        require(settleMillis >= 0)
+    }
+
+    fun reset() {
+        suspendedSince = Long.MIN_VALUE
+        resumedAt = Long.MIN_VALUE
+    }
+
+    fun observe(
+        captureWidth: Int,
+        captureHeight: Int,
+        displayWidth: Int,
+        displayHeight: Int,
+        nowMillis: Long,
+        tolerateRotation: Boolean,
+    ): CaptureRotationDecision {
+        if (displayWidth == captureWidth && displayHeight == captureHeight) {
+            if (suspendedSince != Long.MIN_VALUE) {
+                suspendedSince = Long.MIN_VALUE
+                resumedAt = nowMillis
+                return CaptureRotationDecision.Resumed
+            }
+            if (resumedAt != Long.MIN_VALUE && nowMillis - resumedAt < settleMillis) {
+                return CaptureRotationDecision.Settling
+            }
+            resumedAt = Long.MIN_VALUE
+            return CaptureRotationDecision.Deliver
+        }
+        val stopReason = "屏幕尺寸从${captureWidth}x${captureHeight}变为${displayWidth}x${displayHeight}，" +
+            "为避免投影画面缩在角落，请保持游戏当前方向并重新授权屏幕捕获"
+        val rotatedOnly = displayWidth == captureHeight && displayHeight == captureWidth
+        if (!rotatedOnly || !tolerateRotation) return CaptureRotationDecision.Stop(stopReason)
+        if (suspendedSince == Long.MIN_VALUE) {
+            suspendedSince = nowMillis
+            resumedAt = Long.MIN_VALUE
+            return CaptureRotationDecision.SuspensionStarted(captureWidth, captureHeight, displayWidth, displayHeight)
+        }
+        if (nowMillis - suspendedSince > graceMillis) {
+            return CaptureRotationDecision.Stop("屏幕旋转超过${graceMillis / 1_000} 秒未恢复；$stopReason")
+        }
+        return CaptureRotationDecision.Suspended
     }
 }
 

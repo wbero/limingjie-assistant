@@ -3,7 +3,9 @@ package com.landosol.toolbox.automation.capture
 import java.nio.ByteBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -39,6 +41,85 @@ class MediaProjectionCaptureServiceTest {
         repeat(5) { assertNull(gate.observe(portrait)) }
 
         assertEquals(true, gate.exhausted)
+    }
+
+    @Test
+    fun `a transient portrait rotation suspends frames and resumes after settling`() {
+        // 2026-09-25 vivo diag: the SDK's portrait UnionActivity rotated the display for ~4 s and
+        // the old code stopped capture on the first callback, stranding the reset in WAITING_LOGIN.
+        val gate = CaptureTransientRotationGate(graceMillis = 10_000L, settleMillis = 1_000L)
+        fun observe(width: Int, height: Int, now: Long) = gate.observe(1920, 1080, width, height, now, tolerateRotation = true)
+
+        assertEquals(CaptureRotationDecision.Deliver, observe(1920, 1080, 0L))
+        assertEquals(
+            CaptureRotationDecision.SuspensionStarted(1920, 1080, 1080, 1920),
+            observe(1080, 1920, 100L),
+        )
+        assertEquals(CaptureRotationDecision.Suspended, observe(1080, 1920, 4_000L))
+        assertEquals(CaptureRotationDecision.Resumed, observe(1920, 1080, 4_300L))
+        // The rotation animation may still be in the first landscape frames.
+        assertEquals(CaptureRotationDecision.Settling, observe(1920, 1080, 4_900L))
+        assertEquals(CaptureRotationDecision.Deliver, observe(1920, 1080, 5_400L))
+    }
+
+    @Test
+    fun `only deliver decisions hand frames to recognizers`() {
+        assertTrue(CaptureRotationDecision.Deliver.deliversFrame)
+        assertFalse(CaptureRotationDecision.Suspended.deliversFrame)
+        assertFalse(CaptureRotationDecision.Resumed.deliversFrame)
+        assertFalse(CaptureRotationDecision.Settling.deliversFrame)
+        assertFalse(CaptureRotationDecision.SuspensionStarted(1920, 1080, 1080, 1920).deliversFrame)
+        assertFalse(CaptureRotationDecision.Stop("x").deliversFrame)
+    }
+
+    @Test
+    fun `a rotation that outlasts the grace period still stops capture`() {
+        val gate = CaptureTransientRotationGate(graceMillis = 10_000L)
+
+        gate.observe(1920, 1080, 1080, 1920, 0L, tolerateRotation = true)
+        assertEquals(CaptureRotationDecision.Suspended, gate.observe(1920, 1080, 1080, 1920, 10_000L, tolerateRotation = true))
+        val stop = gate.observe(1920, 1080, 1080, 1920, 10_001L, tolerateRotation = true)
+
+        assertTrue(stop is CaptureRotationDecision.Stop)
+        assertTrue((stop as CaptureRotationDecision.Stop).reason.contains("重新授权屏幕捕获"))
+    }
+
+    @Test
+    fun `a real resolution change keeps the fail-closed stop`() {
+        val gate = CaptureTransientRotationGate()
+
+        val decision = gate.observe(1920, 1080, 1600, 900, 0L, tolerateRotation = true)
+
+        assertEquals(
+            CaptureRotationDecision.Stop(
+                "屏幕尺寸从1920x1080变为1600x900，为避免投影画面缩在角落，请保持游戏当前方向并重新授权屏幕捕获",
+            ),
+            decision,
+        )
+    }
+
+    @Test
+    fun `a second rotation gets its own grace period`() {
+        val gate = CaptureTransientRotationGate(graceMillis = 10_000L, settleMillis = 0L)
+
+        gate.observe(1920, 1080, 1080, 1920, 0L, tolerateRotation = true)
+        gate.observe(1920, 1080, 1920, 1080, 8_000L, tolerateRotation = true)
+        assertTrue(gate.observe(1920, 1080, 1080, 1920, 9_000L, tolerateRotation = true) is CaptureRotationDecision.SuspensionStarted)
+        assertEquals(CaptureRotationDecision.Suspended, gate.observe(1920, 1080, 1080, 1920, 18_000L, tolerateRotation = true))
+    }
+
+    @Test
+    fun `channels without a rotating SDK keep the immediate fail-closed stop`() {
+        val gate = CaptureTransientRotationGate()
+
+        val decision = gate.observe(1920, 1080, 1080, 1920, 0L, tolerateRotation = false)
+
+        assertEquals(
+            CaptureRotationDecision.Stop(
+                "屏幕尺寸从1920x1080变为1080x1920，为避免投影画面缩在角落，请保持游戏当前方向并重新授权屏幕捕获",
+            ),
+            decision,
+        )
     }
 
     @Test

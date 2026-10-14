@@ -140,6 +140,8 @@ class GameSessionResetWorkflow(
     private val totalTimeoutMillis: Long = DEFAULT_TOTAL_TIMEOUT_MILLIS,
     /** Mirrors every recognized frame to the debug dashboard so the reset phase is observable. */
     private val debugFramePublisher: ((CapturedFrame, GameSessionResetState, LabyrinthEntryFrameResult, AutomationOverlayPresentation) -> Unit)? = null,
+    /** Channel SDK login dialogs (九游) recognised through accessibility, not frames. */
+    private val channelPrompts: ChannelLoginPromptAssistant? = null,
 ) {
     private val mutex = Mutex()
     private val actionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -167,16 +169,34 @@ class GameSessionResetWorkflow(
     @Volatile
     private var clientObserved = false
 
+    /**
+     * Frames observed before this time belong to a channel SDK login dialog that the accessibility
+     * poll has just seen. The entry planner must not tap through it: 2026-10-05 九游 debug bundle,
+     * the planner read the 登录历史 dialog as an UNKNOWN pre-announcement frame and kept tapping
+     * (950,930) outside it until the reset gave up.
+     */
+    @Volatile
+    private var channelPromptVisibleUntil = Long.MIN_VALUE
+
+    @Volatile
+    private var lastChannelPromptPollAt = Long.MIN_VALUE
+
     init {
         require(totalTimeoutMillis > 0)
     }
 
-    suspend fun start(): GameSessionResetStartResult = mutex.withLock {
-        startLocked(onSaveRoundResult)
+    /**
+     * @param clientHardClosed the caller has just hard-closed the client (大退) before a reroll, so
+     *   there is no session to invalidate and no point waiting for the client to show up: cold-start
+     *   it and let the entry planner log in from the title.
+     */
+    suspend fun start(clientHardClosed: Boolean = false): GameSessionResetStartResult = mutex.withLock {
+        startLocked(onSaveRoundResult, clientHardClosed)
     }
 
     private suspend fun startLocked(
         saveRoundResult: suspend () -> Unit,
+        clientHardClosed: Boolean = false,
     ): GameSessionResetStartResult {
         activeSessionId?.let { return GameSessionResetStartResult.AlreadyRunning(it) }
         if (!captureActive()) {
@@ -228,6 +248,9 @@ class GameSessionResetWorkflow(
         lastStageChangeAt = clock()
         lastObservedPage = LabyrinthEntryPageState.UNKNOWN
         clientObserved = false
+        channelPromptVisibleUntil = Long.MIN_VALUE
+        lastChannelPromptPollAt = Long.MIN_VALUE
+        channelPrompts?.reset()
         _state.value = GameSessionResetState(
             status = GameSessionResetStatus.RUNNING,
             sessionId = session.id,
@@ -261,6 +284,7 @@ class GameSessionResetWorkflow(
             runResetFlow(
                 sessionId = session.id,
                 saveRoundResult = saveRoundResult,
+                clientHardClosed = clientHardClosed,
             )
         }
         return GameSessionResetStartResult.Started(session.id)
@@ -307,6 +331,7 @@ class GameSessionResetWorkflow(
     private suspend fun runResetFlow(
         sessionId: AutomationSessionId,
         saveRoundResult: suspend () -> Unit,
+        clientHardClosed: Boolean = false,
     ) {
         val outcome = runCatching {
             withTimeout(totalTimeoutMillis) {
@@ -320,24 +345,38 @@ class GameSessionResetWorkflow(
                 // A round can begin while the client is still opening. Give it time to reach the
                 // foreground before judging which page it is on; otherwise every frame belongs to
                 // the launcher and the peek below can only report UNKNOWN.
-                awaitClientObserved(sessionId, CLIENT_PRESENCE_TIMEOUT_MILLIS)
-                val observedPage = awaitObservedPage(sessionId, PAGE_PEEK_TIMEOUT_MILLIS)
-                val skipTermination = gameSessionResetSkipsTermination(observedPage, clientObserved)
+                // A hard-closed client cannot appear on its own; waiting for it only costs time.
+                if (!clientHardClosed) awaitClientObserved(sessionId, CLIENT_PRESENCE_TIMEOUT_MILLIS)
+                val observedPage = if (clientHardClosed) {
+                    LabyrinthEntryPageState.UNKNOWN
+                } else {
+                    awaitObservedPage(sessionId, PAGE_PEEK_TIMEOUT_MILLIS)
+                }
+                // A round can begin with a channel login dialog already over the title (2026-10-12
+                // diag: the page read UNKNOWN, the flow hunted a 黎明界 trigger to invalidate a
+                // session, timed out, and the reset failed before WAITING_LOGIN, the only stage
+                // that handles the dialog). A channel login prompt on screen means the client is
+                // still logging in: there is no session to invalidate.
+                val channelPrompt = if (clientHardClosed) null else channelPrompts?.peek()
+                val skipTermination = clientHardClosed || channelPrompt != null ||
+                    gameSessionResetSkipsTermination(observedPage, clientObserved)
                 Log.d(
                     LOG_TAG,
-                    "peek page=$observedPage clientObserved=$clientObserved skipTermination=$skipTermination",
+                    "peek page=$observedPage clientObserved=$clientObserved hardClosed=$clientHardClosed " +
+                        "channelPrompt=${channelPrompt?.rule?.id} skipTermination=$skipTermination",
                 )
                 if (skipTermination) {
                     setMessage(
-                        if (!clientObserved) {
-                            "未看到公主连结画面，没有可失效的旧会话；直接进入登录导航"
-                        } else {
-                            "客户端在 ${observedPage.name}，尚未载入黎明界，无需触发会话失效"
+                        when {
+                            clientHardClosed -> "游戏已在刷开局前大退，冷启动公主连结"
+                            channelPrompt != null -> "客户端停在渠道登录界面（${channelPrompt.rule.label}），无需触发会话失效"
+                            !clientObserved -> "未看到公主连结画面，没有可失效的旧会话；直接进入登录导航"
+                            else -> "客户端在 ${observedPage.name}，尚未载入黎明界，无需触发会话失效"
                         },
                     )
                     // Nothing was terminated, so the client may simply not be running. Ask the
                     // backend to bring it up; the entry planner drives everything after that.
-                    if (!clientObserved) {
+                    if (clientHardClosed || !clientObserved) {
                         transitionTo(sessionId, GameSessionResetStage.RELAUNCHING, "启动公主连结")
                         val relaunch = backend.relaunchClient()
                         if (relaunch != GameClientRelaunchResult.LAUNCH_REQUESTED) {
@@ -439,15 +478,57 @@ class GameSessionResetWorkflow(
     ) {
         // 识别帧回调驱动推进；此处等待目标阶段被 onFrame 转换到达
         while (activeSessionId == sessionId && stage != target) {
+            if (!captureActive()) {
+                // Without frames nothing can reach the target; report why instead of idling until
+                // the total timeout (for example a rotation that outlasted the capture grace).
+                error(CaptureStateRegistry.lastStopReason() ?: "屏幕捕获已停止，请重新授权")
+            }
             if (stage == GameSessionResetStage.FAILED) error("会话重置失败")
             if (stage == GameSessionResetStage.SESSION_BLOCKED) {
                 onBlocked(sessionId, _state.value.lastBlock)
                 error("会话被阻塞：${_state.value.lastBlock}")
             }
+            pollChannelPrompts(sessionId)
             kotlinx.coroutines.delay(FRAME_POLL_MILLIS)
         }
         if (activeSessionId != sessionId) error("会话重置已被停止")
         if (stage != target) error("会话重置未到达目标阶段：$target")
+    }
+
+    /**
+     * Channel SDK login dialogs are Android views drawn over the game, read through accessibility
+     * rather than frames (a portrait SDK page never yields a landscape frame). Polled from the flow
+     * loop while the reset waits for login, sharing [inFlight] with frame actions so the two never
+     * tap at once.
+     */
+    private suspend fun pollChannelPrompts(sessionId: AutomationSessionId) {
+        val assistant = channelPrompts ?: return
+        if (stage != GameSessionResetStage.WAITING_LOGIN || _state.value.paused) return
+        val now = clock()
+        if (lastChannelPromptPollAt != Long.MIN_VALUE && now - lastChannelPromptPollAt < CHANNEL_PROMPT_POLL_MILLIS) return
+        if (!inFlight.compareAndSet(false, true)) return
+        try {
+            lastChannelPromptPollAt = now
+            when (val step = assistant.step(now)) {
+                ChannelPromptStep.None -> channelPromptVisibleUntil = Long.MIN_VALUE
+                is ChannelPromptStep.Seen -> {
+                    channelPromptVisibleUntil = now + CHANNEL_PROMPT_HOLD_MILLIS
+                    setMessage("渠道登录界面：${step.label}，确认中")
+                }
+                is ChannelPromptStep.Activated -> {
+                    channelPromptVisibleUntil = now + CHANNEL_PROMPT_HOLD_MILLIS
+                    val current = _state.value
+                    _state.value = current.copy(
+                        actionCount = current.actionCount + 1,
+                        message = "渠道登录界面：${step.label}，已点击",
+                    )
+                    overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
+                }
+                is ChannelPromptStep.Exhausted -> markFailed(sessionId, step.reason)
+            }
+        } finally {
+            inFlight.set(false)
+        }
     }
 
     private fun onFrame(
@@ -504,6 +585,11 @@ class GameSessionResetWorkflow(
         if (!inFlight.compareAndSet(false, true)) return
         actionScope.launch {
             try {
+                if (clock() < channelPromptVisibleUntil) {
+                    // A white SDK dialog can also score as a session prompt; neither the block
+                    // classifier nor the entry planner may act on it while the poll owns it.
+                    return@launch
+                }
                 val expectedExpiryPopup =
                     stage == GameSessionResetStage.TERMINATING &&
                         backend.kind == ClientTerminationKind.SESSION_EXPIRY
@@ -704,6 +790,9 @@ class GameSessionResetWorkflow(
         const val LOG_TAG = "LabyrinthReset"
         const val OWNER = "game-session-reset"
         const val FRAME_POLL_MILLIS = 250L
+        const val CHANNEL_PROMPT_POLL_MILLIS = 500L
+        /** How long one sighting keeps frame actions away from the dialog; > one poll interval. */
+        const val CHANNEL_PROMPT_HOLD_MILLIS = 1_500L
         /** How long the PENDING peek waits for a recognised page before defaulting to termination. */
         const val PAGE_PEEK_TIMEOUT_MILLIS = 6_000L
 
