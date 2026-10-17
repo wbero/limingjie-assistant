@@ -3,8 +3,32 @@ package com.landosol.toolbox.labyrinth.vision
 import com.landosol.toolbox.clanbattle.recognition.PixelImage
 import com.landosol.toolbox.labyrinth.LabyrinthCharacterAttribute
 import java.util.IdentityHashMap
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+/**
+ * Worker threads for the two scoring passes.
+ *
+ * Deliberately not the CPU count. The game shares the same virtual machine, and the formation
+ * search in this project already measured 4 threads at 0.58x wall clock while 8 threads made the
+ * whole run slower, so 4 is the measured sweet spot for this kind of per-frame number crunching.
+ */
+private const val ICON_SCORING_THREADS = 4
+
+/** Below this many candidates the thread hand-off costs more than the scoring it saves. */
+private const val ICON_SCORING_MIN_CANDIDATES = 128
+
+/** No shard should carry fewer than this, otherwise the per-shard fixed cost dominates. */
+private const val ICON_SCORING_MIN_PER_SHARD = 64
+
+/** One process-wide pool: a run calls [LabyrinthCharacterIconMatcher.match] tens of thousands of times. */
+private val ICON_SCORING_EXECUTOR: ExecutorService =
+    Executors.newFixedThreadPool(ICON_SCORING_THREADS) { runnable ->
+        Thread(runnable, "labyrinth-icon-score").apply { isDaemon = true }
+    }
 
 /** Shared safety floor for every page that identifies a character from the full icon pack. */
 const val LABYRINTH_CHARACTER_ICON_SAFE_CONFIDENCE = 0.35
@@ -61,23 +85,6 @@ class LabyrinthCharacterIconMatcher(
     }
 
     /**
-     * Scratch buffers for the expected (pack-icon) side of the two scoring passes.
-     *
-     * Both passes fill their sample arrays and consume them inside a single call -- [correlation]
-     * reads the first `count` entries and nothing keeps the arrays afterwards -- so one set of
-     * buffers per pass is reused instead of allocating them per candidate template. On the real
-     * pack that is roughly 9 900 arrays (a few megabytes) of garbage per [match].
-     *
-     * This relies on the recognition pipeline handling one frame at a time, the same assumption the
-     * shared [GradientTemplateMatcher] offset caches already make. If a later step parallelises this
-     * class, these have to become per-thread or be allocated per call again.
-     */
-    private val coarseExpectedScratch = Array(3) { DoubleArray(COARSE_SAMPLE_COUNT) }
-    private val scoreColorExpectedScratch = Array(3) { DoubleArray(SCORE_SAMPLE_COUNT) }
-    private val scoreLuminanceExpectedScratch = DoubleArray(SCORE_SAMPLE_COUNT)
-    private val scoreGradientExpectedScratch = DoubleArray(SCORE_SAMPLE_COUNT)
-
-    /**
      * Sample values hoisted out of the scoring loops because they cannot change.
      *
      * Both passes walk a fixed sample grid and derive, for every cell, three colour channels, a
@@ -102,17 +109,34 @@ class LabyrinthCharacterIconMatcher(
         val gradient = DoubleArray(gridSize)
     }
 
+    /** Coarse grid: colour only, so it never pays for the luminance and gradient it never reads. */
+    private class CoarseSamples {
+        val color = Array(3) { DoubleArray(COARSE_SAMPLE_COUNT) }
+    }
+
+    /** The cells one mask keeps, in the row-major order the scoring loops used to visit them. */
+    private class GridMask(val indices: IntArray, val count: Int)
+
     /**
      * Pack-icon samples, one entry per template, built lazily and kept for the lifetime of the
      * matcher because a template never changes.
      *
-     * Memory cost: 795 templates × 5 DoubleArray(240) × 8 B ≈ 7.3 MiB of array payload, plus the
-     * per-entry [GridSamples] objects and the [IdentityHashMap] overhead. This is a deliberate
-     * trade-off for skipping roughly 1.2 million luminance conversions per [match]; it is bounded
-     * by the icon pack size and does not grow with the number of frames processed.
+     * Memory cost: 795 templates × 5 DoubleArray(240) × 8 B ≈ 7.3 MiB of array payload for the
+     * scoring grid, plus 795 × 3 DoubleArray(108) × 8 B ≈ 2.1 MiB for the coarse grid, plus the
+     * per-entry objects and the [IdentityHashMap] overhead. That is a deliberate trade-off for
+     * skipping roughly 1.2 million luminance conversions, and the per-candidate coordinate maths of
+     * the coarse pass, on every [match]; it is bounded by the icon pack size and does not grow with
+     * the number of frames processed.
+     *
+     * Both maps are written only from [templateSamplesOf] / [coarseSamplesOf], which [match] calls
+     * on its own thread before it hands the scoring passes to the pool. The scoring passes read the
+     * resolved grids, never these maps, so no worker thread ever mutates them.
      */
     private val templateSamples =
         IdentityHashMap<LabyrinthBattleCharacterTemplate, GridSamples>()
+
+    private val coarseTemplateSamples =
+        IdentityHashMap<LabyrinthBattleCharacterTemplate, CoarseSamples>()
 
     /**
      * @param rosterCharacterIds the characters that can actually appear here, or null for any.
@@ -149,24 +173,28 @@ class LabyrinthCharacterIconMatcher(
         // Sample the frame side once for this call. Every candidate shares the same comparison
         // rectangle (the pack ships icons of a single size), so these grids are shared across all
         // candidates. They stay locals, so the whole-frame PixelImage is released as soon as match()
-        // returns instead of being retained in a field.
+        // returns instead of being retained in a field. The mask is not applied here: the grid is
+        // stored complete so it can serve any mask, and the GridMask below decides what is read.
         val observedTarget = candidateTemplates.firstOrNull()
             ?.let { comparisonRect(frame, iconRect, it.image) }
         val coarseObserved = observedTarget?.let {
-            fillObservedSamples(frame, it, mask, COARSE_SAMPLE_WIDTH, COARSE_SAMPLE_HEIGHT)
+            sampleGrid(frame, it, COARSE_SAMPLE_WIDTH, COARSE_SAMPLE_HEIGHT)
         }
         val scoreObserved = observedTarget?.let {
-            fillObservedSamples(
-                frame = frame,
-                target = it,
-                mask = mask,
-                sampleWidth = SCORE_SAMPLE_WIDTH,
-                sampleHeight = SCORE_SAMPLE_HEIGHT,
-                withLuminanceAndGradient = true,
-            )
+            sampleGrid(frame, it, SCORE_SAMPLE_WIDTH, SCORE_SAMPLE_HEIGHT, withLuminanceAndGradient = true)
         }
-        val coarse = candidateTemplates
-            .map { template -> template to coarseIconScore(template, mask, coarseObserved) }
+        // Which grid cells the mask keeps. A pure function of the mask and the grid size, so it is
+        // derived once per call rather than once per candidate.
+        val coarseMask = maskOf(mask, COARSE_SAMPLE_WIDTH, COARSE_SAMPLE_HEIGHT)
+        val scoreMask = maskOf(mask, SCORE_SAMPLE_WIDTH, SCORE_SAMPLE_HEIGHT)
+        // Resolve the pack side on this thread, so the workers below read plain arrays and never
+        // touch the single-writer sample caches.
+        val coarsePack = candidateTemplates.map { coarseSamplesOf(it) }
+        val coarseScores = scoreAll(candidateTemplates.size) { index ->
+            coarseIconScore(coarsePack[index], coarseObserved, coarseMask)
+        }
+        val coarse = candidateTemplates.indices
+            .map { index -> candidateTemplates[index] to coarseScores[index] }
             .sortedByDescending { (_, score) -> score }
         // The coarse pass is cheap and still sees the whole pack, so it can answer whether the
         // roster is trustworthy before the expensive pass commits to it.
@@ -179,10 +207,15 @@ class LabyrinthCharacterIconMatcher(
             ROSTER_OUTSIDER_OVERRIDE_MARGIN
         val considered = if (rosterUsable) insideRoster else coarse
         val coarseCutoff = (considered.firstOrNull()?.second ?: 0.0) * COARSE_KEEP_RATIO
-        val ranked = considered
+        val finalists = considered
             .filterIndexed { index, (_, score) -> index < MIN_ICON_CANDIDATES || score >= coarseCutoff }
             .take(MAX_ICON_CANDIDATES)
-            .map { (template, _) -> template to iconScore(template, mask, scoreObserved) }
+        val finalPack = finalists.map { (template, _) -> templateSamplesOf(template) }
+        val finalScores = scoreAll(finalists.size) { index ->
+            iconScore(finalPack[index], scoreObserved, scoreMask)
+        }
+        val ranked = finalists.indices
+            .map { index -> finalists[index].first to finalScores[index] }
             .sortedByDescending { (_, score) -> score }
         // Keep only the strongest icon variant for each logical character. A character can have
         // multiple star/rarity icon variants and those variants must never compete with each other
@@ -301,76 +334,45 @@ class LabyrinthCharacterIconMatcher(
         )
     }
 
+    /**
+     * Coarse-pass score for one pack icon.
+     *
+     * Both sides are already resolved when this runs, so the body only reads: no scratch buffer, no
+     * cache lookup and no writes to anything another worker could see.
+     */
     private fun coarseIconScore(
-        template: LabyrinthBattleCharacterTemplate,
-        mask: LabyrinthCharacterIconMask,
+        pack: CoarseSamples,
         observed: GridSamples?,
+        mask: GridMask,
     ): Double {
         // observed is null only when the comparison rectangle does not exist for this frame and
         // rectangle (the pack ships icons of a single size, so the rectangle is shared by every
         // candidate and was sampled once up in [match]).
         if (observed == null) return 0.0
-        val sampleWidth = COARSE_SAMPLE_WIDTH
-        val sampleHeight = COARSE_SAMPLE_HEIGHT
-        val observedColor = observed.color
-        val expected = coarseExpectedScratch
-        var count = 0
-        repeat(sampleHeight) { sampleY ->
-            val yRatio = sampleY.toDouble() / (sampleHeight - 1)
-            for (sampleX in 0 until sampleWidth) {
-                val xRatio = sampleX.toDouble() / (sampleWidth - 1)
-                if (isMasked(xRatio, yRatio, mask)) continue
-                val imageX = (xRatio * (template.image.width - 1)).roundToInt()
-                val imageY = ICON_CROP_TOP + (yRatio * (ICON_CROP_HEIGHT - 1)).roundToInt()
-                val expectedColor = template.image[imageX, imageY]
-                for (channel in 0..2) {
-                    expected[channel][count] = channel(expectedColor, channel).toDouble()
-                }
-                count++
-            }
-        }
+        val count = mask.count
         if (count < 8) return 0.0
         return (0..2).map { channel ->
-            correlation(observedColor[channel], expected[channel], count)
+            correlation(observed.color[channel], pack.color[channel], mask, count)
         }.average().coerceAtLeast(0.0)
     }
 
+    /** Scoring-pass score for one pack icon; read-only for the same reason as [coarseIconScore]. */
     private fun iconScore(
-        template: LabyrinthBattleCharacterTemplate,
-        mask: LabyrinthCharacterIconMask,
+        pack: GridSamples,
         observed: GridSamples?,
+        mask: GridMask,
     ): Double {
         // observed is null only when the comparison rectangle does not exist for this frame and
         // rectangle (the pack ships icons of a single size, so the rectangle is shared by every
         // candidate and was sampled once up in [match]).
         if (observed == null) return 0.0
-        // Pack side: a template never changes, so its grid is derived once per template and reused
-        // for every candidate from then on, in this match() and in later ones.
-        val expected = templateSamplesOf(template)
-        val colorExpected = scoreColorExpectedScratch
-        val luminanceExpected = scoreLuminanceExpectedScratch
-        val gradientExpected = scoreGradientExpectedScratch
-        var count = 0
-        repeat(SCORE_SAMPLE_HEIGHT) { sampleY ->
-            val yRatio = sampleY.toDouble() / (SCORE_SAMPLE_HEIGHT - 1)
-            for (sampleX in 0 until SCORE_SAMPLE_WIDTH) {
-                val xRatio = sampleX.toDouble() / (SCORE_SAMPLE_WIDTH - 1)
-                if (isMasked(xRatio, yRatio, mask)) continue
-                val grid = sampleY * SCORE_SAMPLE_WIDTH + sampleX
-                colorExpected[0][count] = expected.color[0][grid]
-                colorExpected[1][count] = expected.color[1][grid]
-                colorExpected[2][count] = expected.color[2][grid]
-                luminanceExpected[count] = expected.luminance[grid]
-                gradientExpected[count] = expected.gradient[grid]
-                count++
-            }
-        }
+        val count = mask.count
         if (count < 20) return 0.0
         val colorScore = (0..2).map { channel ->
-            correlation(observed.color[channel], colorExpected[channel], count)
+            correlation(observed.color[channel], pack.color[channel], mask, count)
         }.average().coerceAtLeast(0.0)
-        val luminanceScore = correlation(observed.luminance, luminanceExpected, count).coerceAtLeast(0.0)
-        val gradientScore = correlation(observed.gradient, gradientExpected, count).coerceAtLeast(0.0)
+        val luminanceScore = correlation(observed.luminance, pack.luminance, mask, count).coerceAtLeast(0.0)
+        val gradientScore = correlation(observed.gradient, pack.gradient, mask, count).coerceAtLeast(0.0)
         return (colorScore * 0.55 + luminanceScore * 0.25 + gradientScore * 0.20).coerceIn(0.0, 1.0)
     }
 
@@ -400,33 +402,85 @@ class LabyrinthCharacterIconMatcher(
         return samples
     }
 
-    /** Fills one observed-side grid from the frame, in the same order the loops used to. */
-    private fun fillObservedSamples(
-        frame: PixelImage,
-        target: EntryPixelRect,
+    /** The pack-icon side of the coarse grid: colour only, constant for the life of the template. */
+    private fun coarseSamplesOf(template: LabyrinthBattleCharacterTemplate): CoarseSamples {
+        coarseTemplateSamples[template]?.let { return it }
+        val image = template.image
+        val samples = CoarseSamples()
+        var grid = 0
+        repeat(COARSE_SAMPLE_HEIGHT) { sampleY ->
+            val yRatio = sampleY.toDouble() / (COARSE_SAMPLE_HEIGHT - 1)
+            for (sampleX in 0 until COARSE_SAMPLE_WIDTH) {
+                val xRatio = sampleX.toDouble() / (COARSE_SAMPLE_WIDTH - 1)
+                val imageX = (xRatio * (image.width - 1)).roundToInt()
+                val imageY = ICON_CROP_TOP + (yRatio * (ICON_CROP_HEIGHT - 1)).roundToInt()
+                val pixel = image[imageX, imageY]
+                for (channel in 0..2) {
+                    samples.color[channel][grid] = channel(pixel, channel).toDouble()
+                }
+                grid++
+            }
+        }
+        coarseTemplateSamples[template] = samples
+        return samples
+    }
+
+    /**
+     * Which grid cells [mask] keeps, in the row-major order the scoring loops visit them.
+     *
+     * Rebuilt per call on purpose. The mask carries the clip ratios of the card that produced it,
+     * so caching by mask would grow with the number of distinct clip positions a run sees, while a
+     * rebuild is only a few hundred comparisons.
+     */
+    private fun maskOf(
         mask: LabyrinthCharacterIconMask,
         sampleWidth: Int,
         sampleHeight: Int,
-        withLuminanceAndGradient: Boolean = false,
-    ): GridSamples {
-        val samples = GridSamples(sampleWidth * sampleHeight)
+    ): GridMask {
+        val indices = IntArray(sampleWidth * sampleHeight)
         var count = 0
         repeat(sampleHeight) { sampleY ->
             val yRatio = sampleY.toDouble() / (sampleHeight - 1)
             for (sampleX in 0 until sampleWidth) {
                 val xRatio = sampleX.toDouble() / (sampleWidth - 1)
                 if (isMasked(xRatio, yRatio, mask)) continue
+                indices[count] = sampleY * sampleWidth + sampleX
+                count++
+            }
+        }
+        return GridMask(indices, count)
+    }
+
+    /**
+     * Samples one observed-side grid from the frame, in the order the scoring loops visit it.
+     *
+     * The mask is deliberately not applied here: the grid is stored complete so the same samples
+     * can serve any mask, and [GridMask] then decides which cells a correlation actually reads.
+     */
+    private fun sampleGrid(
+        frame: PixelImage,
+        target: EntryPixelRect,
+        sampleWidth: Int,
+        sampleHeight: Int,
+        withLuminanceAndGradient: Boolean = false,
+    ): GridSamples {
+        val samples = GridSamples(sampleWidth * sampleHeight)
+        var grid = 0
+        repeat(sampleHeight) { sampleY ->
+            val yRatio = sampleY.toDouble() / (sampleHeight - 1)
+            for (sampleX in 0 until sampleWidth) {
+                val xRatio = sampleX.toDouble() / (sampleWidth - 1)
                 val frameX = target.left + (xRatio * (target.width - 1)).roundToInt()
                 val frameY = target.top + (yRatio * (target.height - 1)).roundToInt()
                 val pixel = frame[frameX, frameY]
                 for (channel in 0..2) {
-                    samples.color[channel][count] = channel(pixel, channel).toDouble()
+                    samples.color[channel][grid] = channel(pixel, channel).toDouble()
                 }
                 if (withLuminanceAndGradient) {
-                    samples.luminance[count] = luminance(pixel).toDouble()
-                    samples.gradient[count] = localGradient(frame, frameX, frameY, target)
+                    samples.luminance[grid] = luminance(pixel).toDouble()
+                    samples.gradient[grid] = localGradient(frame, frameX, frameY, target)
                 }
-                count++
+                grid++
             }
         }
         return samples
@@ -475,22 +529,28 @@ class LabyrinthCharacterIconMatcher(
     }
 
     /**
-     * Pearson correlation over the first [count] entries.
+     * Pearson correlation over the [count] cells [mask] keeps.
      *
      * The two means are accumulated with an explicit loop instead of `take(count).average()`. Both
      * forms compute `sum / count` with the sum accumulated from index 0 in the same order, so the
      * result is bit-identical -- but `take()` copied every element into a boxed `Double` (growing an
      * `ArrayList` on the way) purely to add numbers up. On the real 795-icon pack that is about
      * 1.75 million throwaway objects per [match], and it is the single largest cost this class has.
+     *
+     * Reading through [GridMask.indices] instead of a compacted copy visits exactly the same values
+     * in exactly the same order, so both sums -- and the result -- are unchanged. That is what lets
+     * the pack grid stay in one cache per template instead of being copied per mask.
      */
-    private fun correlation(left: DoubleArray, right: DoubleArray, count: Int): Double {
+    private fun correlation(left: DoubleArray, right: DoubleArray, mask: GridMask, count: Int): Double {
         if (count <= 1) return 0.0
+        val indices = mask.indices
         var leftSum = 0.0
         var rightSum = 0.0
         var index = 0
         while (index < count) {
-            leftSum += left[index]
-            rightSum += right[index]
+            val at = indices[index]
+            leftSum += left[at]
+            rightSum += right[at]
             index++
         }
         val leftMean = leftSum / count
@@ -500,8 +560,9 @@ class LabyrinthCharacterIconMatcher(
         var rightSquare = 0.0
         index = 0
         while (index < count) {
-            val leftDelta = left[index] - leftMean
-            val rightDelta = right[index] - rightMean
+            val at = indices[index]
+            val leftDelta = left[at] - leftMean
+            val rightDelta = right[at] - rightMean
             numerator += leftDelta * rightDelta
             leftSquare += leftDelta * leftDelta
             rightSquare += rightDelta * rightDelta
@@ -509,6 +570,44 @@ class LabyrinthCharacterIconMatcher(
         }
         val denominator = sqrt(leftSquare * rightSquare)
         return if (denominator <= 1e-9) 0.0 else numerator / denominator
+    }
+
+    /**
+     * Scores [size] candidates with [score], on the scoring pool when there is enough work.
+     *
+     * Determinism does not depend on how the work is split: every candidate is scored entirely by
+     * one shard, from values it only reads, and the shards are collected in submission order, so
+     * the returned array is identical for any shard count. That is also why the shard count may
+     * vary with the candidate count.
+     */
+    private fun scoreAll(size: Int, score: (Int) -> Double): DoubleArray {
+        val scores = DoubleArray(size)
+        val shards = if (size < ICON_SCORING_MIN_CANDIDATES) {
+            1
+        } else {
+            minOf(ICON_SCORING_THREADS, size / ICON_SCORING_MIN_PER_SHARD).coerceAtLeast(1)
+        }
+        if (shards <= 1) {
+            for (index in 0 until size) scores[index] = score(index)
+            return scores
+        }
+        val perShard = (size + shards - 1) / shards
+        val tasks = (0 until shards).map { shard ->
+            val from = shard * perShard
+            val to = minOf(size, from + perShard)
+            Callable<DoubleArray> {
+                val part = DoubleArray(to - from)
+                for (index in from until to) part[index - from] = score(index)
+                part
+            }
+        }
+        var at = 0
+        for (future in ICON_SCORING_EXECUTOR.invokeAll(tasks)) {
+            val part = future.get()
+            System.arraycopy(part, 0, scores, at, part.size)
+            at += part.size
+        }
+        return scores
     }
 
     private fun channel(color: Int, channel: Int): Int = when (channel) {
