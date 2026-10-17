@@ -734,3 +734,27 @@ internal fun labyrinthEventChoiceCommitExpired(
     (nowMillis - committedAtMillis).coerceAtLeast(0L) >= retryAfterMillis
 
 internal const val EVENT_CHOICE_COMMIT_RETRY_MILLIS = 6_000L
+
+/**
+ * Whether a committed selection tap on a single-pick choice page has waited long enough to be
+ * considered lost.
+ *
+ * This is [labyrinthEventChoiceCommitExpired] generalised to the remaining page that holds a
+ * "committed" latch, so a tap the game never accepted cannot pin the run forever. Same reasoning:
+ * a real selection leaves the page within a second or two, so a page that is still the same choice
+ * after this long means the tap never landed. Retrying is safe because these pages accept a single
+ * selection per round — if the tap did land and the page merely lagged, the page has changed by the
+ * time the retry is planned.
+ *
+ * Contrast the 2026-10-12 bundles: a RELIC_CHOICE page sat motionless for 120 s with actionCount
+ * frozen and was only ended by the page-stall watchdog, because the relic latch cleared on a page
+ * change alone and the page never changed.
+ */
+internal fun labyrinthSelectionCommitExpired(
+    committedAtMillis: Long,
+    nowMillis: Long,
+    retryAfterMillis: Long = SELECTION_COMMIT_RETRY_MILLIS,
+): Boolean = committedAtMillis != Long.MIN_VALUE &&
+    (nowMillis - committedAtMillis).coerceAtLeast(0L) >= retryAfterMillis
+
+internal const val SELECTION_COMMIT_RETRY_MILLIS = 6_000L
