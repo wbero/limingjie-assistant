@@ -1311,6 +1311,10 @@ class LabyrinthEntryRecognitionSession(
     private var pendingRelicSelection: LabyrinthRelicMatch? = null
     @Volatile
     private var relicChoiceCommitted = false
+    /** When [relicChoiceCommitted] was last set, for the lost-tap retry (see [labyrinthSelectionCommitExpired]). */
+    private var relicChoiceCommittedAt = Long.MIN_VALUE
+    /** How many times a lost relic tap has already been retried this round. */
+    private var relicChoiceCommitAttempts = 0
     private val relicAcquisitionGate = LabyrinthRelicAcquisitionGate()
     @Volatile
     private var eventChoiceCommitted = false
@@ -2818,6 +2822,8 @@ class LabyrinthEntryRecognitionSession(
             relicStackLedger.clear()
             pendingRelicSelection = null
             relicChoiceCommitted = false
+            relicChoiceCommittedAt = Long.MIN_VALUE
+            relicChoiceCommitAttempts = 0
             actionScope.launch {
                 runCatching {
                     persistenceMutex.withLock { store.startNew(accountId, timestampMillis) }
@@ -2889,6 +2895,8 @@ class LabyrinthEntryRecognitionSession(
             pendingRelicSelection.also {
                 pendingRelicSelection = null
                 relicChoiceCommitted = false
+                relicChoiceCommittedAt = Long.MIN_VALUE
+                relicChoiceCommitAttempts = 0
                 relicAcquisitionGate.reset()
             }
         } else {
@@ -4623,6 +4631,8 @@ class LabyrinthEntryRecognitionSession(
             if (pageState == LabyrinthEntryPageState.RELIC_CHOICE) {
                 pendingRelicSelection = null
                 relicChoiceCommitted = false
+                relicChoiceCommittedAt = Long.MIN_VALUE
+                relicChoiceCommitAttempts = 0
             }
             if (pageState == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) {
                 resetBattleTeamExecutionTracking()
@@ -5124,9 +5134,31 @@ class LabyrinthEntryRecognitionSession(
                 }
 
             LabyrinthEntryPageState.RELIC_CHOICE -> {
-                if (relicChoiceCommitted) {
+                if (relicChoiceCommitted &&
+                    !labyrinthSelectionCommitExpired(relicChoiceCommittedAt, timestampMillis)
+                ) {
+                    null
+                } else if (relicChoiceCommitted &&
+                    relicChoiceCommitAttempts >= MAX_SELECTION_COMMIT_ATTEMPTS
+                ) {
+                    finishFromPlanner(
+                        sessionId,
+                        "遗物选择已点击${relicChoiceCommitAttempts}次仍停留在遗物页；停止以免反复空点",
+                    )
                     null
                 } else {
+                    if (relicChoiceCommitted) {
+                        // The tap was sent and the page never moved on. The latch used to clear
+                        // only on a page change, and the page was the thing that never changed, so
+                        // the run sat until the page-stall watchdog ended it (2026-10-12 bundles:
+                        // 120 s on one RELIC_CHOICE page with actionCount frozen). Re-arm and retry
+                        // now that the tap is provably lost.
+                        relicChoiceCommitted = false
+                        relicChoiceCommittedAt = Long.MIN_VALUE
+                        relicChoiceCommitAttempts++
+                        pendingRelicSelection = null
+                        nodeLog("relic-choice-retry attempts=$relicChoiceCommitAttempts", warning = true)
+                    }
                     relicChoicePolicy.choose(
                         acquired = _state.value.observedRelics,
                         candidates = result.relicChoiceSelection?.choices.orEmpty(),
@@ -6013,6 +6045,7 @@ class LabyrinthEntryRecognitionSession(
                     }
                     if (kind == LabyrinthPostEntryActionKind.SELECT_RELIC) {
                         relicChoiceCommitted = true
+                        relicChoiceCommittedAt = clock()
                     }
                     if (kind == LabyrinthPostEntryActionKind.SELECT_ROLE_REWARD) {
                         roleRewardChoiceCommitted = true
@@ -6252,6 +6285,8 @@ class LabyrinthEntryRecognitionSession(
         resetPostEntryStall()
         pendingRelicSelection = null
         relicChoiceCommitted = false
+        relicChoiceCommittedAt = Long.MIN_VALUE
+        relicChoiceCommitAttempts = 0
         relicFocusMark = null
         relicStackLedger.clear()
         clearCharacterAcquisitionContext()
@@ -8694,6 +8729,8 @@ class LabyrinthEntryRecognitionSession(
         const val POST_ENTRY_ACTION_INTERVAL_MILLIS = 1_500L
 
         const val MAX_EVENT_CHOICE_COMMIT_ATTEMPTS = 3
+        /** Lost-tap retries allowed on a single-pick choice page before the run stops. */
+        const val MAX_SELECTION_COMMIT_ATTEMPTS = 3
         const val SHOP_PURCHASE_TRANSITION_TIMEOUT_MILLIS = 8_000L
         const val SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS = 8_000L
         const val SHOP_REFRESH_SETTLE_MILLIS = 500L
