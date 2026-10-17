@@ -100,6 +100,39 @@ object EntryAnchorId {
     const val BATTLE_TEAM_START_BUTTON = "entry.battle_team.start_button"
     /** 「未搜索到该角色。」 in the roster area: the current filter (e.g. 有效效果) lists nobody. */
     const val BATTLE_TEAM_ROSTER_EMPTY_NOTICE = "entry.battle_team.roster_empty_notice"
+    /**
+     * 编组页最底行那个白色圆形「特别装备」入口按钮，在白色「取消」左侧、同处一条白底按钮带。
+     *
+ * 入口按钮只在基准图 team-homare-eriko-20261002.png 上完整露出（圆心 (1227, 906)、
+ * 直径约 97 px，与「取消」中心 y 差 2 px）；弹窗打开时该行被完全遮住，
+     * 被完全遮住，所以入口几何以基准图为准，实机帧上只由模板匹配负责确认「它还在不在原位」。
+     */
+    const val BATTLE_TEAM_SPECIAL_EQUIPMENT_BUTTON = "entry.battle_team.special_equipment_button"
+    /**
+     * 「特别装备设定」弹窗（弹窗1）左上角部：标题带左端从 (49,45) 斜切到 (72,60)，整条标题横幅
+     * 会把黑色斜角混进模板，所以这个角部小图只作粗筛。弹窗身份由 [SPECIAL_EQUIPMENT_DIALOG_TITLE]
+     * 的标题文字与正文中部「自动装备」、右下蓝「装备确定」两态模板共同确定。
+     */
+    const val SPECIAL_EQUIPMENT_DIALOG_ANCHOR = "entry.special_equipment.dialog_anchor"
+    /**
+     * 「特别装备设定」的标题文字本体：只取标题带中段、避开左右两端斜角。
+     *
+     * 这是弹窗1 的内容类独有特征——「系列效果一览」面板同样是白色面板、蓝色标题带与白色页脚，
+     * 面板外观（角部金饰、标题带底色、页脚）两边共用，不能用来判身份；只有标题文字能分开
+     * 「特别装备设定」与「系列效果一览」。
+     */
+    const val SPECIAL_EQUIPMENT_DIALOG_TITLE = "entry.special_equipment.dialog_title"
+    /** 弹窗1 正文中部的白色「自动装备」按钮。 */
+    const val SPECIAL_EQUIPMENT_AUTO_BUTTON = "entry.special_equipment.auto_button"
+    /** 弹窗1 右下蓝「装备确定」：可点击态（更亮）。 */
+    const val SPECIAL_EQUIPMENT_EQUIP_CONFIRM_ENABLED = "entry.special_equipment.equip_confirm_enabled"
+    /** 弹窗1 右下蓝「装备确定」：不可点击态（被压暗）。两态共用同一 ROI。 */
+    const val SPECIAL_EQUIPMENT_EQUIP_CONFIRM_DISABLED = "entry.special_equipment.equip_confirm_disabled"
+    /** 「自动特别装备设定」弹窗（弹窗2）标题带中心区，不含左右两端斜角。 */
+    const val SPECIAL_EQUIPMENT_AUTO_DIALOG_ANCHOR = "entry.special_equipment.auto_dialog_anchor"
+    /** 弹窗2 右侧蓝「确认」。 */
+    const val SPECIAL_EQUIPMENT_AUTO_DIALOG_CONFIRM_BUTTON =
+        "entry.special_equipment.auto_dialog_confirm_button"
     const val SESSION_ERROR_TITLE = "session.error.title"
     const val SESSION_RETURN_TITLE = "session.return.title"
     const val SESSION_DATE_CHANGE_TITLE = "session.date_change.title"
@@ -213,6 +246,14 @@ object EntryAnchorId {
         BATTLE_TEAM_CURRENT_MEMBERS_SUMMARY,
         BATTLE_TEAM_CANCEL_BUTTON,
         BATTLE_TEAM_START_BUTTON,
+        BATTLE_TEAM_SPECIAL_EQUIPMENT_BUTTON,
+        SPECIAL_EQUIPMENT_DIALOG_ANCHOR,
+        SPECIAL_EQUIPMENT_DIALOG_TITLE,
+        SPECIAL_EQUIPMENT_AUTO_BUTTON,
+        SPECIAL_EQUIPMENT_EQUIP_CONFIRM_ENABLED,
+        SPECIAL_EQUIPMENT_EQUIP_CONFIRM_DISABLED,
+        SPECIAL_EQUIPMENT_AUTO_DIALOG_ANCHOR,
+        SPECIAL_EQUIPMENT_AUTO_DIALOG_CONFIRM_BUTTON,
         SESSION_ERROR_TITLE,
         SESSION_RETURN_TITLE,
         SESSION_DATE_CHANGE_TITLE,
@@ -344,6 +385,11 @@ data class LabyrinthEntryFrameResult(
     val battleEndConfirmation: LabyrinthBattleEndConfirmationObservation? = null,
     val exChallenge: LabyrinthExChallengeObservation? = null,
     val exEncounter: LabyrinthExEncounterObservation? = null,
+    /**
+     * 「特别装备」两弹窗与编组页入口的观测。stage 为 null 表示本帧不是特别装备弹窗；整体为
+     * null 表示这一帧既不是特别装备弹窗、也没在编组页上（上层据此知道「与特别装备无关」）。
+     */
+    val specialEquipment: LabyrinthSpecialEquipmentObservation? = null,
     val frameWidth: Int = 0,
     val frameHeight: Int = 0,
     val stageMillis: Map<String, Long> = emptyMap(),
@@ -388,6 +434,9 @@ class LabyrinthEntryFrameProcessor(
     private val battleEndConfirmationDetector: LabyrinthBattleEndConfirmationDetector =
         LabyrinthBattleEndConfirmationDetector(),
     private val exChallengeDetector: LabyrinthExChallengeDetector = LabyrinthExChallengeDetector(),
+    /** 「特别装备」两弹窗与编组页入口；只读锚点分数与两个固定 ROI，不产生动作。 */
+    private val specialEquipmentRecognizer: LabyrinthSpecialEquipmentRecognizer =
+        LabyrinthSpecialEquipmentRecognizer(),
     private val finalBossOnly: () -> Boolean = { false },
     private val nodeSearchHint: () -> NodeSearchHint? = { null },
     /** Roles this run has acquired; the only ones a team page can show. Empty means "unknown". */
@@ -458,6 +507,7 @@ class LabyrinthEntryFrameProcessor(
         var battleFailure: LabyrinthBattleFailureObservation? = null
         var battleEndConfirmation: LabyrinthBattleEndConfirmationObservation? = null
         var exChallenge: LabyrinthExChallengeObservation? = null
+        var specialEquipment: LabyrinthSpecialEquipmentObservation? = null
         var nodesNanos = 0L
         var bossPlatformNanos = 0L
         var battleTeamNanos = 0L
@@ -515,6 +565,15 @@ class LabyrinthEntryFrameProcessor(
                     reason = null,
                 )
             } ?: classified
+            // 「特别装备」：先判弹窗2、再判弹窗1（弹窗2 打开时弹窗1 的按钮仍在屏幕上但被压暗，
+            // 含弹窗2 的帧不得当作「弹窗1 + 装备确定」解读）。编组页上即使入口按钮没被认出也会
+            // 返回观测，好让上层拿到「找不到入口按钮」这一可诊断结论而不是「没有观测」。
+            specialEquipment = specialEquipmentRecognizer.recognize(
+                frame = frame,
+                anchorScores = anchorScores,
+                onBattleTeamSelectionPage =
+                    observation.state == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION,
+            )
             exChallenge = exChallengeDetector.detect(frame, observation.state)
             nodeMoveConfirmation = nodeMoveConfirmationDetector.detect(frame)
             if (
@@ -669,6 +728,7 @@ class LabyrinthEntryFrameProcessor(
             battleFailure = battleFailure,
             battleEndConfirmation = battleEndConfirmation,
             exChallenge = exChallenge,
+            specialEquipment = specialEquipment,
             frameWidth = frame.width,
             frameHeight = frame.height,
         )
@@ -818,6 +878,18 @@ class LabyrinthEntryFrameProcessor(
             standard(EntryAnchorId.BATTLE_TEAM_START_BUTTON, 1565, 850, 270, 110),
             // 未搜索到该角色 notice, centred in the empty roster area (2026-09-18 screenshot).
             standard(EntryAnchorId.BATTLE_TEAM_ROSTER_EMPTY_NOTICE, 802, 527, 297, 38),
+ // 特别装备：入口几何量自基准图 team-homare-eriko-20261002.png，两个弹窗量自 1920x1080 实机帧；
+ // 几何、参考系与两态实测值见 android/docs/special-equipment.md（本机逐帧标定记录不入库）。
+ // 两个「装备确定」模板共用同一 ROI —— 不可点击态只是同一按钮被压暗，
+            // 形状不变，只有像素亮度能分开两态。
+            standard(EntryAnchorId.BATTLE_TEAM_SPECIAL_EQUIPMENT_BUTTON, 1180, 858, 97, 97),
+            standard(EntryAnchorId.SPECIAL_EQUIPMENT_DIALOG_ANCHOR, 46, 42, 50, 58),
+            standard(EntryAnchorId.SPECIAL_EQUIPMENT_DIALOG_TITLE, 835, 59, 264, 54),
+            standard(EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_BUTTON, 995, 922, 387, 71),
+            standard(EntryAnchorId.SPECIAL_EQUIPMENT_EQUIP_CONFIRM_ENABLED, 1428, 917, 396, 81),
+            standard(EntryAnchorId.SPECIAL_EQUIPMENT_EQUIP_CONFIRM_DISABLED, 1428, 917, 396, 81),
+            standard(EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_ANCHOR, 760, 56, 400, 58),
+            standard(EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_CONFIRM_BUTTON, 982, 917, 396, 91),
             standard(EntryAnchorId.SESSION_ERROR_TITLE, 485, 259, 948, 66),
             standard(EntryAnchorId.SESSION_RETURN_TITLE, 756, 692, 410, 94),
             standard(EntryAnchorId.SESSION_DATE_CHANGE_TITLE, 790, 258, 340, 70),

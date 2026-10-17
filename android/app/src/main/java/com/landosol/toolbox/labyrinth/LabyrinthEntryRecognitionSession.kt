@@ -35,6 +35,7 @@ import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryPageState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthBattleTeamObservation
 import com.landosol.toolbox.labyrinth.vision.LabyrinthBattleTeamRecognitionState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthRelicMatch
+import com.landosol.toolbox.labyrinth.vision.labyrinthRelicDetailHoldsFrame
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopDialogState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemKind
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemStatus
@@ -995,6 +996,13 @@ internal fun labyrinthSessionBlockObservation(
     result: LabyrinthEntryFrameResult,
     classifier: SessionBlockClassifier = SessionBlockClassifier(),
 ): LabyrinthSessionBlockObservation {
+    // 「特别装备」的两个弹窗是本特性的新 chrome，却与这里「故意做宽」的蓝标题模板同壳：
+    // 一旦某帧把它读成会话失效，自动化会去点「返回标题」并把整局丢掉。
+    // 窄排除：只在观测确实给出弹窗 stage（≥0.70 的模板证据）时生效；stage 为 null 时——包括
+    // 真实的过期/掉线弹窗——本函数逐字不变（反向断言见 LabyrinthSpecialEquipmentSessionFlowTest）。
+    if (result.specialEquipment?.stage != null) {
+        return LabyrinthSessionBlockObservation(SessionBlockKind.NONE, returnTitleRect = null)
+    }
     // The reconnect detector uses a deliberately broad blue-title template. A normal labyrinth
     // movement dialog shares that chrome, so its more specific two-button detector must win.
     if (result.nodeMoveConfirmation != null) {
@@ -1235,9 +1243,137 @@ class LabyrinthEntryRecognitionSession(
     private var exhaustedBattleRosterFiltersKey: String? = null
     @Volatile
     private var lastBattleTeamActionAt = Long.MIN_VALUE
+    /**
+     * 会话级动作节流：本会话**任意**两次点击之间强制 [BATTLE_TEAM_ACTION_INTERVAL_MILLIS]。
+     *
+     * 「特别装备」流程与编组/开战路径各有自己的执行跟踪，但游戏只有一个输入口。两者各持一个时间戳时，
+     * 弹窗「取消」刚点完 0.76s，编组路径只看到自己的旧时间戳就派发「战斗开始」，被关闭动画吃掉；
+     * 所以这两个流程共用这一个时间戳：任一方派发点击都盖上它，任一方派发前都要等它过期。
+     */
+    @Volatile
+    private var lastSessionActionAt = Long.MIN_VALUE
+    /**
+     * 「编组页动作已经派发、画面却还没有推进」这一件事的全部状态：START_BATTLE 与 NEXT_BOSS_TEAM
+     * 共用同一处记账（不回滚在各处各打一块补丁）。
+     *
+     * 只有「从派发那一刻起每一帧都还是同一个编组页签名」才算「画面没动」——游戏只要收下了这一下，
+     * 画面就会换页或换 Boss 页签。超过 [BATTLE_TEAM_ACTION_ACK_TIMEOUT_MILLIS] 即认定这一下没被接受，
+     * 回滚本次提交并重新规划；重复失败落在 [MAX_BATTLE_TEAM_ACTION_UNCONFIRMED] 次以内。
+     */
+    private data class PendingBattleTeamAction(
+        val kind: LabyrinthBattleTeamExecutionKind,
+        val label: String,
+        val confirmedTeamIds: List<String>,
+        val signature: String,
+        val dispatchedAt: Long,
+        /**
+         * 派发这一刻之前 [lastNormalBattleTeamSignature] 的值（只有 START_BATTLE 会带）。
+         *
+         * 「派发后画面没推进」说明这一下没被游戏收下：回收把记忆还原成这个当次捕获的原值，也就是
+         * **最近一次派发之前**的值。重试链上的每一次派发都按同一规则重新捕获，因此它不等同于
+         * 「最近一场真正开起来的战斗」的编组。
+         */
+        val previousNormalTeamSignature: String? = null,
+    )
+
+    @Volatile
+    private var pendingBattleTeamAction: PendingBattleTeamAction? = null
+    /** 连续多少次「编组页动作派发后画面没动」；画面前进一次或整页重来即清零。 */
+    @Volatile
+    private var battleTeamActionUnconfirmedAttempts = 0
+    /**
+     * 超限停机已经申请、但还没落定的停机文案（非空即表示申请中）。
+     *
+     * 停机走动作协程（[finishFromPlanner] → `launchGuardedAction`），单动作锁被占的那一帧申请会被
+     * 静默丢掉；所以申请之后每帧都要再要一次，直到运行真的停住（与既有 5 分钟战斗等待超时的写法一致）。
+     */
+    @Volatile
+    private var battleTeamActionStopReason: String? = null
+    /**
+     * 编组页自己的停滞计时戳。
+     *
+     * [handlePostEntryPage] 走到编组页就 return，通用的 120 秒停滞看门狗对这个页面永远不可达
+     * （[LabyrinthPostEntryTapPlan] 里 BATTLE_TEAM_SELECTION 是显式 null），所以本页必须自己记账。
+     */
+    @Volatile
+    private var battleTeamPageStallSince = Long.MIN_VALUE
+    /**
+     * 「特别装备」自动穿戴的本轮状态（纯状态机见 [labyrinthSpecialEquipmentDecision]）。
+     *
+     * **刻意不放进 [resetBattleTeamExecutionTracking]**：那个函数会在「页面状态变成编组页」时被调用
+     * （`handlePostEntryPage` 里进入 BATTLE_TEAM_SELECTION 的那一支），而弹窗开合本身就会让页面
+     * 状态抖动，放进去会让本轮标记被抖掉、流程半途重来。这里的标记只在「稳定地离开编组页」时清零。
+     */
+    @Volatile
+    private var specialEquipmentFlowStage = LabyrinthSpecialEquipmentFlowStage.INACTIVE
+    @Volatile
+    private var specialEquipmentStepAttempts = 0
+    @Volatile
+    private var specialEquipmentStepStartedAt = Long.MIN_VALUE
+    /** 本轮是否真的看到过弹窗（stage 非空）；决定「弹窗刚关」这一帧要不要让给关闭动画。 */
+    @Volatile
+    private var specialEquipmentDialogObserved = false
+    /**
+     * 「特别装备弹窗刚关闭」这一帧已经交给编组路径、但还没被让掉。
+     *
+     * 弹窗关闭动画期间点在「战斗开始」上会被游戏吞掉，所以关闭后的第一帧只让一帧：
+     * 由 [handleBattleTeamSelectionExecution] 消费，消费的那一帧不派发任何编组/开战点击。
+     */
+    @Volatile
+    private var specialEquipmentModalCloseSettlePending = false
+    /** 连续多少帧落在非编组页（UNKNOWN 不累计）；达到 [SPECIAL_EQUIPMENT_LEAVE_STABLE_FRAMES] 才算离开。 */
+    @Volatile
+    private var specialEquipmentAwayFrames = 0
+    /**
+     * 超限逃生那次点击（点弹窗1 左下白色「取消」）已经决定、但还没派发出去时的待办。
+     *
+     * 决策只在「超限的那一帧」带 tap，而 stage 那时已经推进到 DONE，后续帧的 DONE 决策不再带 tap；
+     * 没有这个待办字段，逃生点击会被动作间隔或帧序吞掉：表现为「只被决定、从未点击」。
+     * 待办本身也有窗口（[specialEquipmentEscapeDeadline]）：窗口内始终派发不出去就放弃这次点击，
+     * 由「本轮已结束但弹窗仍开着」的分支停机并保留诊断。
+     */
+    @Volatile
+    private var specialEquipmentPendingEscape: LabyrinthSpecialEquipmentTap? = null
+    /** 逃生点击派发后的等弹窗关闭上限；超期仍未关就停机并保留诊断。 */
+    @Volatile
+    private var specialEquipmentEscapeDeadline = Long.MIN_VALUE
+    /** 超限/放弃时的诊断原文：后续帧不得用「本轮已结束，继续编组与开战」把它覆盖掉。 */
+    @Volatile
+    private var specialEquipmentDiagnostic: String? = null
+    /**
+     * 「装备确定」两态判定的连续同类证据计数（跨帧稳定）：单帧（尤其是弹窗切换的过渡帧）不下结论。
+     * 由 [labyrinthSpecialEquipmentEquipEvidenceStreak] 每帧推进，`confirmedEnabled` 才交给决策。
+     */
+    @Volatile
+    private var specialEquipmentEquipEvidence = LabyrinthSpecialEquipmentEquipEvidenceStreak()
+    /**
+     * 本轮是不是**放弃**收尾（超限、或入口缺失跳过）。
+     *
+     * 它只影响停机文案：既可能因为「超限放弃 + 弹窗没关」停机，也可能因为「本轮已正常结束 + 弹窗
+     * 又被打开」停机，两者不能共用一句「已放弃本轮」。
+     */
+    @Volatile
+    private var specialEquipmentAbandoned = false
+    /**
+     * 本轮武装时所在的队伍页签（非「Boss 多队编组页的页签」一律为 null）。
+     *
+     * Boss 多队编组页上的每个页签是一支独立的队伍，所以页签是「一轮」的身份之一：页签一变，上一个
+     * 页签的结束标记不属于当前队伍，必须重新武装，否则队伍2 会沿用队伍1 的标记而永不穿戴。
+     */
+    @Volatile
+    private var specialEquipmentRoundBossTeamIndex: Int? = null
     private val committedBattleCharacterIds = linkedSetOf<String>()
     /** Teams actually committed during the current combat attempt, grouped by team signature. */
     private val currentBattleTeamSignatures = linkedSetOf<String>()
+    /**
+     * 上一场**普通**关卡的编组签名（[labyrinthBattleTeamSignature]）。
+     *
+     * 只有普通关卡的 START_BATTLE 会把它更新为本场编组；EX / Boss 的战斗不会改变它（回收时写回的只是
+     * 当次捕获的原值）。刻意不放进 [resetBattleTeamExecutionTracking] 与单场重置：它是跨战斗的记忆，
+     * 本轮普通关卡若与它完全相同就跳过特别装备流程。
+     */
+    @Volatile
+    private var lastNormalBattleTeamSignature: String? = null
     /** Exact team signatures observed in failed attempts for this node. Never submit them again. */
     private val failedBattleTeamSignatures = linkedSetOf<String>()
     @Volatile
@@ -1256,6 +1392,11 @@ class LabyrinthEntryRecognitionSession(
     private var roleDisplayNames: Map<String, String> = emptyMap()
     private var bossTeamMode: LabyrinthBossTeamMode = LabyrinthBossTeamMode.MULTI_TEAM
     private var preferPureBossDamageSystem: Boolean = true
+    /**
+     * 启动时抓取的设置快照，只用来回答「本次战斗的关卡类型要不要自动穿戴特别装备」：
+     * 运行中保存新配置不改变本轮，只影响下一次启动。
+     */
+    private var specialEquipmentSettings: LabyrinthStrategySettings? = null
     private var singleBossFallbackToMultiAfterThreeFailures: Boolean = false
     private var singleBossRetryCountBeforeMulti: Int = 2
     private var pendingSingleBossFallbackToMulti: Boolean = false
@@ -1608,6 +1749,7 @@ class LabyrinthEntryRecognitionSession(
             configuredBossTeamMode = snapshot.settings.bossTeamMode
             bossTeamMode = configuredBossTeamMode
             preferPureBossDamageSystem = snapshot.settings.preferPureBossDamageSystem
+            specialEquipmentSettings = snapshot.settings
             singleBossFallbackToMultiAfterThreeFailures =
                 snapshot.settings.singleBossFallbackToMultiAfterThreeFailures
             singleBossRetryCountBeforeMulti = snapshot.settings.singleBossRetryCountBeforeMulti
@@ -2183,7 +2325,8 @@ class LabyrinthEntryRecognitionSession(
         if (!current.dryRun && entryPhaseComplete &&
             handleBattleWaitFrame(sessionId, result, timestampMillis)
         ) return
-        if (result.relicDetailObservation != null) {
+        val relicDetail = result.relicDetailObservation
+        if (relicDetail != null && labyrinthRelicDetailHoldsFrame(result)) {
             // This popup is only ever opened by hand, and the run deliberately does not close it
             // so the operator can read it. That made it an unbounded wait: a popup left open (or
             // one the classifier keeps seeing) parked the route with no deadline at all. Reading
@@ -2197,7 +2340,7 @@ class LabyrinthEntryRecognitionSession(
                 )
                 return
             }
-            _state.value = _state.value.copy(message = if (result.relicDetailObservation.titleConfirmed) {
+            _state.value = _state.value.copy(message = if (relicDetail.titleConfirmed) {
                 "系列详情核对中：只更新已确认的可见系列；可手动滚动，关闭后继续路线"
             } else "正在确认系列详情弹窗，暂不执行点击")
             overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
@@ -2346,6 +2489,21 @@ class LabyrinthEntryRecognitionSession(
         // frame: nothing behind it can be clicked, and no map gesture can reach the map.
         val genericConfirmOwnsFrame = !current.dryRun &&
             labyrinthGenericConfirmDialogRect(result) != null
+        // 「特别装备」弹窗是编组页之上的模态：它自己的按钮与上面共享的「确认」模板互相干扰，而压暗
+        // 底层页之后页面分类可能落到 UNKNOWN，那条路根本到不了编组页处理器。所以这一支**必须排在
+        // genericConfirmOwnsFrame 之前**，并且只凭观测的 stage（或本轮已武装）进入，与当帧 pageState
+        // 无关。流程没接管（返回 false）时不改变任何既有分支的行为。
+        val specialEquipmentOwnsFrame = !current.dryRun &&
+            (
+                result.specialEquipment?.stage != null ||
+                    specialEquipmentFlowStage != LabyrinthSpecialEquipmentFlowStage.INACTIVE
+                )
+        if (
+            specialEquipmentOwnsFrame &&
+            handleSpecialEquipmentFlowFrame(sessionId, result, timestampMillis)
+        ) {
+            return
+        }
         when {
             genericConfirmOwnsFrame ->
                 handlePostEntryPage(sessionId, result, frameWidth, frameHeight, timestampMillis)
@@ -3067,6 +3225,7 @@ class LabyrinthEntryRecognitionSession(
         if (pageState != LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) {
             lastBattleTeamRecommendationKey = null
             lastBattleTeamSelectionPlanLog = null
+            battleTeamPageStallSince = Long.MIN_VALUE
             _state.value = _state.value.copy(
                 battleTeamRecommendation = null,
                 battleTeamRecommendationUnavailableReason = null,
@@ -3527,14 +3686,19 @@ class LabyrinthEntryRecognitionSession(
             if (current.message != message) _state.value = current.copy(message = message)
             return
         }
-        lastBattleTeamRecommendationKey = cacheKey
 
         val usedCharacterIds = synchronized(committedBattleCharacterIds) {
             committedBattleCharacterIds.toSet()
         }
         val eligibleCharacterIds = acquiredCharacterIds.filterNot(usedCharacterIds::contains)
         val planner = battleTeamRecommendationPlanner
+        // 「不可用」是否由 cacheKey 的输入唯一决定。规划器自己的结论（没有可用角色、没有合格一号位
+        // 等）是输入的纯函数，可以缓存；真正的瞬时故障（资料未加载、计算抛错）不是，缓存住就等于把
+        // 一次瞬时失败固定成终态、每帧都命中同一条原因。内存不足是唯一的例外：按既有注释，它绝不
+        // 能每帧重算。
+        var recommendationResultCacheable = true
         val recommendationResult = if (planner == null) {
+            recommendationResultCacheable = false
             LabyrinthBattleTeamRecommendationResult.Unavailable(
                 battleTeamRecommendationUnavailableReason ?: "角色决策资料未加载",
             )
@@ -3582,6 +3746,7 @@ class LabyrinthEntryRecognitionSession(
                     )
                 }
             }.getOrElse { failure ->
+                recommendationResultCacheable = failure is OutOfMemoryError
                 LabyrinthBattleTeamRecommendationResult.Unavailable(
                     if (failure is OutOfMemoryError) {
                         // Do not retry every frame or misreport this as missing character data.
@@ -3592,6 +3757,8 @@ class LabyrinthEntryRecognitionSession(
                 )
             }
         }
+        // 只缓存「由 cacheKey 唯一决定」的结果：瞬时故障不写缓存键，下一帧就会重算。
+        lastBattleTeamRecommendationKey = cacheKey.takeIf { recommendationResultCacheable }
         when (recommendationResult) {
             is LabyrinthBattleTeamRecommendationResult.Ready -> {
                 val recommendation = recommendationResult.recommendation
@@ -3936,17 +4103,24 @@ class LabyrinthEntryRecognitionSession(
         val battleResultNextReady = result.observation.state == LabyrinthEntryPageState.BATTLE_RESULT &&
             (result.anchorMatches[EntryAnchorId.BATTLE_RESULT_NEXT_BUTTON]?.score ?: 0.0) >=
             POST_ENTRY_ANCHOR_MIN_SCORE
+        // 「编组页动作派发后画面没动」的兜底必须先于战斗等待判定：编组页在战斗等待的 3 秒宽限内是
+        // WAIT，宽限一过又变成 NONE，两条路都会把这一帧继续交下去，而卡住的运行永远等不到结果。
+        if (handleUnconfirmedBattleTeamActionFrame(sessionId, result, timestampMillis)) return true
         when (battleWait.observe(
             page = result.observation.state,
             now = timestampMillis,
             battleResultNextReady = battleResultNextReady,
         )) {
-            LabyrinthBattleWaitDecision.NONE -> return false
+            LabyrinthBattleWaitDecision.NONE -> {
+                acknowledgeBattleTeamActionProgress(result)
+                return false
+            }
             LabyrinthBattleWaitDecision.TIMED_OUT -> {
                 finishFromPlanner(sessionId, "等待战斗结算超过5分钟，已停止并保留诊断状态")
                 return true
             }
             LabyrinthBattleWaitDecision.WAIT -> {
+                acknowledgeBattleTeamActionProgress(result)
                 clearCharacterAcquisitionContext()
                 waitingForManualRoleSelection = false
                 postEntryUnknownSince = Long.MIN_VALUE
@@ -3964,6 +4138,116 @@ class LabyrinthEntryRecognitionSession(
                 return true
             }
         }
+    }
+
+    /**
+     * 画面已经离开编组页（或换了 Boss 页签）⇒ 上一次编组页动作被游戏收下了。
+     *
+     * 撤掉「没被收下」的记账并清零连续失败计数，让后面的动作重新从零开始。
+     *
+     * 「进度」的判据是**编组页签名变了**（页面类型 + Boss 队伍页签），不是「页面类型变了」：
+     * Boss 切队成功后页面类型仍然是编组页，只有页签变——只看页面类型会把一次成功的切队当成「点了
+     * 没反应」，pending 与连续失败计数就会带到下一队去。签名没变的编组页帧什么都不能清（那正是
+     * 「派发了但画面没动」的本体），没有 pending 时也不能清（刚被判未确认的那一次要留住计数）。
+     */
+    private fun acknowledgeBattleTeamActionProgress(result: LabyrinthEntryFrameResult) {
+        if (result.observation.state == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) {
+            val pending = pendingBattleTeamAction
+            if (pending == null || battleTeamEditorSignature(result) == pending.signature) return
+        }
+        pendingBattleTeamAction = null
+        battleTeamActionUnconfirmedAttempts = 0
+    }
+
+    /**
+     * 「编组页动作派发之后画面原地不动」的统一兜底：START_BATTLE 与 NEXT_BOSS_TEAM 共用。
+     *
+     * 判定条件刻意最窄——从派发那一刻起**每一帧都还是同一个编组页签名**：游戏只要收下了这一下，
+     * 画面必然换页（加载 / 战斗 / 结算 / 未知过渡）或换 Boss 页签。超过
+     * [BATTLE_TEAM_ACTION_ACK_TIMEOUT_MILLIS] 仍原地不动 ⇒ 认定这一下没被接受（实机上被弹窗关闭动画
+     * 吞掉），回滚本次提交并重置，让下一帧重建计划重试；重复失败落在
+     * [MAX_BATTLE_TEAM_ACTION_UNCONFIRMED] 次以内，超限停机并保留诊断，所以既不会静默无限等待，
+     * 也不会无限重发。
+     */
+    private fun handleUnconfirmedBattleTeamActionFrame(
+        sessionId: AutomationSessionId,
+        result: LabyrinthEntryFrameResult,
+        timestampMillis: Long,
+    ): Boolean {
+        battleTeamActionStopReason?.let { reason ->
+            // 停机申请还没落定：每帧再要一次（申请本身可能被单动作锁瞬时挡下）。
+            finishFromPlanner(sessionId, reason)
+            return true
+        }
+        val pending = pendingBattleTeamAction ?: return false
+        if (result.observation.state != LabyrinthEntryPageState.BATTLE_TEAM_SELECTION ||
+            battleTeamEditorSignature(result) != pending.signature
+        ) {
+            acknowledgeBattleTeamActionProgress(result)
+            return false
+        }
+        if (timestampMillis - pending.dispatchedAt < BATTLE_TEAM_ACTION_ACK_TIMEOUT_MILLIS) return false
+        pendingBattleTeamAction = null
+        battleTeamActionUnconfirmedAttempts++
+        if (battleTeamActionUnconfirmedAttempts > MAX_BATTLE_TEAM_ACTION_UNCONFIRMED) {
+            val reason = "队伍编组页动作连续${battleTeamActionUnconfirmedAttempts}次派发后画面仍未推进" +
+                "（${pending.label}）；已停止并保留诊断状态"
+            battleTeamActionStopReason = reason
+            finishFromPlanner(sessionId, reason)
+            return true
+        }
+        recoverUnconfirmedBattleTeamAction(sessionId, pending)
+        return true
+    }
+
+    /**
+     * 「编组页动作已派发、画面却没动」的回收。
+     *
+     * START_BATTLE 的提交（角色 id、队伍签名、以及普通关卡的上一场编组记忆）是在派发成功的同一处写进去的，
+     * 所以回收也必须一起还回去；NEXT_BOSS_TEAM 在派发时并没有提交任何角色（提交发生在页签真的变化之后），
+     * 只撤销它的待办推进。两条路径都重置战斗等待与编组执行跟踪，并丢掉推荐/计划的缓存，让下一帧重建。
+     */
+    private fun recoverUnconfirmedBattleTeamAction(
+        sessionId: AutomationSessionId,
+        pending: PendingBattleTeamAction,
+    ) {
+        if (
+            pending.kind == LabyrinthBattleTeamExecutionKind.START_BATTLE &&
+            pending.confirmedTeamIds.isNotEmpty()
+        ) {
+            val released = pending.confirmedTeamIds.toSet()
+            synchronized(committedBattleCharacterIds) { committedBattleCharacterIds.removeAll(released) }
+            synchronized(currentBattleTeamSignatures) {
+                currentBattleTeamSignatures.remove(labyrinthBattleTeamSignature(pending.confirmedTeamIds))
+            }
+        }
+        if (pending.kind == LabyrinthBattleTeamExecutionKind.START_BATTLE) {
+            // 这一下没被游戏收下，普通关卡的编组记忆还原成当次捕获的原值（最近一次派发之前的值）。
+            lastNormalBattleTeamSignature = pending.previousNormalTeamSignature
+        }
+        if (pending.kind == LabyrinthBattleTeamExecutionKind.NEXT_BOSS_TEAM) {
+            pendingBossTeamAdvance = null
+        }
+        battleWait.reset()
+        resetBattleTeamExecutionTracking()
+        battleTeamPageStallSince = Long.MIN_VALUE
+        lastBattleTeamRecommendationKey = null
+        lastBattleTeamSelectionPlanLog = null
+        if (activeSessionId == sessionId) {
+            _state.value = _state.value.copy(
+                battleTeamRecommendation = null,
+                battleTeamRecommendationUnavailableReason = null,
+                battleTeamSelectionPlan = null,
+                message = "编组页动作派发后画面未推进（第${battleTeamActionUnconfirmedAttempts}次）：" +
+                    "${pending.label}；已释放本次编组提交与队伍签名，重新规划后重试",
+            )
+        }
+        nodeLog(
+            "battle-team-action-unconfirmed kind=${pending.kind} " +
+                "released=${pending.confirmedTeamIds.joinToString(",")} " +
+                "attempt=${battleTeamActionUnconfirmedAttempts}",
+            warning = true,
+        )
     }
 
     /**
@@ -5489,7 +5773,40 @@ class LabyrinthEntryRecognitionSession(
         )
     }
 
+    /**
+     * 编组页帧的入口：先看一眼特别装备流程是否在等着让帧，再交给编组/开战规划，最后给本页记账。
+     *
+     * 这个页面在 [handlePostEntryPage] 里直接 return，通用的 120 秒停滞看门狗对它永远不可达
+     * （见 [LabyrinthPostEntryTapPlan] 里 BATTLE_TEAM_SELECTION 的显式 null），所以「同一句消息、
+     * 一帧都没有派发动作」的停滞必须在这里自己收尾，否则就是静默无限等待。
+     */
     private fun handleBattleTeamSelectionExecution(
+        sessionId: AutomationSessionId,
+        result: LabyrinthEntryFrameResult,
+        frameWidth: Int,
+        frameHeight: Int,
+        timestampMillis: Long,
+    ) {
+        val messageBefore = _state.value.message
+        planBattleTeamSelectionFrame(sessionId, result, frameWidth, frameHeight, timestampMillis)
+        val progressed = _state.value.frameTrace.actionLabel != null ||
+            _state.value.message != messageBefore
+        if (!progressed && battleTeamPageStallSince != Long.MIN_VALUE &&
+            timestampMillis - battleTeamPageStallSince >= POST_ENTRY_STALL_TIMEOUT_MILLIS
+        ) {
+            finishFromPlanner(
+                sessionId,
+                "队伍编组页连续${(timestampMillis - battleTeamPageStallSince) / 1000}秒没有派发任何编组动作：" +
+                    "${_state.value.message}；已停止并保留诊断状态",
+            )
+            return
+        }
+        if (progressed || battleTeamPageStallSince == Long.MIN_VALUE) {
+            battleTeamPageStallSince = timestampMillis
+        }
+    }
+
+    private fun planBattleTeamSelectionFrame(
         sessionId: AutomationSessionId,
         result: LabyrinthEntryFrameResult,
         frameWidth: Int,
@@ -5568,6 +5885,16 @@ class LabyrinthEntryRecognitionSession(
                 battleTeamRecommendationUnavailableReason = null,
                 message = "Boss切队记录不完整；已自动进入重同步，将清空三队并返回队伍1重新编组",
             )
+            return
+        }
+        // 「特别装备」闸门：Boss 预处理完成之后、产出任何编组执行步（含三条路径各自的 START_BATTLE）
+        // 之前。本轮没结束时这一帧由特别装备流程接管并 return，于是下面三个调用点都无法产出动作；
+        // 本轮结束（成功 / 未变更 / 超限放弃）或不适用时返回 false，原有编组/开战路径逐字继续。
+        if (handleSpecialEquipmentFlowFrame(sessionId, result, timestampMillis)) return
+        if (specialEquipmentModalCloseSettlePending) {
+            // 特别装备弹窗刚关闭：这一帧只让给关闭动画，不派发任何编组/开战点击。紧跟在闸门之后、
+            // 在产出任何执行步之前消费，且只让一帧。
+            specialEquipmentModalCloseSettlePending = false
             return
         }
         val step = (preparationStep ?: if (
@@ -5718,7 +6045,473 @@ class LabyrinthEntryRecognitionSession(
         ) {
             return
         }
+        // 会话级节流：本路径自己的时间戳只在编组执行步之间有效，特别装备流程的点击不写它。
+        // 两条流程之间必须看 [lastSessionActionAt]，否则「特别装备：取消」之后 0.76s 就会派发开战。
+        if (!sessionActionIntervalElapsed(timestampMillis)) {
+            traceReject("session-interval:${timestampMillis - lastSessionActionAt}")
+            return
+        }
+        if (
+            step.kind == LabyrinthBattleTeamExecutionKind.START_BATTLE ||
+            step.kind == LabyrinthBattleTeamExecutionKind.NEXT_BOSS_TEAM
+        ) {
+            // 这两种动作必须把编组页推走：派发即记账，页面原地不动超过动作确认上限就按「没被收下」
+            // 回滚（见 handleBattleWaitFrame）。
+            // 先取旧值：下面会把本场编组写进记忆，而「这一下没被收下」时要还回去的是**写入之前**的
+            // 上一场编组。顺序反了的话回滚只是把新值写成它自己。
+            val previousNormalTeamSignature = lastNormalBattleTeamSignature
+            if (step.kind == LabyrinthBattleTeamExecutionKind.START_BATTLE &&
+                combatContext?.kind == LabyrinthCombatKind.NORMAL &&
+                step.confirmedTeamIds.isNotEmpty()
+            ) {
+                // 普通关卡在这里记下本场编组：下一场若与它完全相同就跳过特别装备流程。EX / Boss 不写。
+                lastNormalBattleTeamSignature = labyrinthBattleTeamSignature(step.confirmedTeamIds)
+            }
+            pendingBattleTeamAction = PendingBattleTeamAction(
+                kind = step.kind,
+                label = step.label,
+                confirmedTeamIds = step.confirmedTeamIds,
+                signature = battleTeamEditorSignature(result),
+                dispatchedAt = timestampMillis,
+                previousNormalTeamSignature = previousNormalTeamSignature.takeIf {
+                    step.kind == LabyrinthBattleTeamExecutionKind.START_BATTLE
+                },
+            )
+        }
+        // 无论哪种动作，派发前都把会话级节流戳盖上（动作被拒时的回退由各自的 Rejected 分支负责）。
+        lastSessionActionAt = timestampMillis
         dispatchBattleTeamAction(sessionId, step, timestampMillis)
+    }
+
+    /**
+     * 「编组页动作是否被画面收下」的签名：页面类型 + Boss 队伍页签。
+     *
+     * Boss 切换队伍时页面类型仍是编组页，只有页签变，所以签名必须带上页签；否则一次成功的「下一队」
+     * 会被当成「点了没反应」。
+     */
+    private fun battleTeamEditorSignature(result: LabyrinthEntryFrameResult): String =
+        result.observation.state.name + ":" + (result.battleTeamSelection?.bossTeamIndex ?: -1)
+
+    /**
+     * 本次战斗的关卡类型是否需要自动穿戴特别装备。
+     *
+     * 判定只读启动时抓取的设置快照（[specialEquipmentSettings]），并且直接调用设置层自己的
+     * [LabyrinthStrategySettings.autoEquipsSpecialEquipment]——「自动穿戴 + 空集合」在那一层就已经
+     * 是「不执行」，这里不再另写一套规则。`combatContext` 为空＝不知道类型 ⇒ 不执行。
+     */
+    private fun specialEquipmentAppliesToCurrentBattle(): Boolean {
+        val kind = combatContext?.kind ?: return false
+        return specialEquipmentSettings?.autoEquipsSpecialEquipment(kind) == true
+    }
+
+    /** 清掉本轮标记（离开编组页、页签更换、或本轮不适用时调用）。 */
+    private fun resetSpecialEquipmentRound() {
+        specialEquipmentFlowStage = LabyrinthSpecialEquipmentFlowStage.INACTIVE
+        specialEquipmentStepAttempts = 0
+        specialEquipmentStepStartedAt = Long.MIN_VALUE
+        specialEquipmentAwayFrames = 0
+        specialEquipmentPendingEscape = null
+        specialEquipmentEscapeDeadline = Long.MIN_VALUE
+        specialEquipmentDiagnostic = null
+        specialEquipmentAbandoned = false
+        specialEquipmentDialogObserved = false
+        specialEquipmentModalCloseSettlePending = false
+        specialEquipmentEquipEvidence = LabyrinthSpecialEquipmentEquipEvidenceStreak()
+        specialEquipmentRoundBossTeamIndex = null
+    }
+
+    /** 当前页签的队伍成员：每个槽位一个 `characterId`，未识别的槽位是 null。 */
+    private fun currentTeamCharacterIds(result: LabyrinthEntryFrameResult): List<String?> =
+        result.battleTeamSelection?.selectedCharacters.orEmpty().map { match -> match.characterId }
+
+    /**
+     * 这一帧是不是「Boss 多队模式编组页的一个队伍页签」。
+     *
+     * 只有这种页面上页签才代表一支独立的队伍：单队模式整段只跑一轮，普通/EX 的队伍页没有页签身份，
+     * 两者都不受「页签更换即重新武装」的影响。
+     */
+    private fun onMultiTeamBossTab(result: LabyrinthEntryFrameResult): Boolean =
+        combatContext?.kind == LabyrinthCombatKind.BOSS &&
+            bossTeamMode == LabyrinthBossTeamMode.MULTI_TEAM &&
+            result.battleTeamSelection?.bossTeamIndex != null
+
+    /**
+     * 本场普通关卡是否与上一场普通战斗的编组完全相同。
+     *
+     * 判据见 [labyrinthSpecialEquipmentTeamIsUnchanged]：数量相同、逐槽都识别出角色、角色集合相同。
+     * EX / Boss 永不跳过；本次战斗类型不在勾选集合内时流程本来就不介入。
+     */
+    private fun specialEquipmentTeamIsUnchanged(result: LabyrinthEntryFrameResult): Boolean {
+        if (combatContext?.kind != LabyrinthCombatKind.NORMAL) return false
+        return labyrinthSpecialEquipmentTeamIsUnchanged(
+            characterIds = currentTeamCharacterIds(result),
+            previousSignature = lastNormalBattleTeamSignature,
+        )
+    }
+
+    /** 只更新消息，避免每帧重建整个 state；消息本身也是停滞看门狗眼里的「进度」。 */
+    private fun publishSpecialEquipmentMessage(message: String) {
+        if (_state.value.message == message) return
+        _state.value = _state.value.copy(message = message)
+    }
+
+    private fun specialEquipmentTapLabel(tap: LabyrinthSpecialEquipmentTap): String = when (tap) {
+        LabyrinthSpecialEquipmentTap.ENTRY -> "特别装备：点击入口「特别装备」"
+        LabyrinthSpecialEquipmentTap.AUTO_BUTTON -> "特别装备：点击「自动装备」"
+        LabyrinthSpecialEquipmentTap.AUTO_CONFIRM -> "特别装备：点击弹窗2「确认」"
+        LabyrinthSpecialEquipmentTap.EQUIP_CONFIRM -> "特别装备：点击「装备确定」"
+        LabyrinthSpecialEquipmentTap.CANCEL -> "特别装备：点击「取消」"
+    }
+
+    /** 决策里的一次点击按按钮称呼（不含动作前缀，用来拼「等待后补发…」这类诊断消息）。 */
+    private fun specialEquipmentTapName(tap: LabyrinthSpecialEquipmentTap): String = when (tap) {
+        LabyrinthSpecialEquipmentTap.ENTRY -> "入口「特别装备」"
+        LabyrinthSpecialEquipmentTap.AUTO_BUTTON -> "「自动装备」"
+        LabyrinthSpecialEquipmentTap.AUTO_CONFIRM -> "弹窗2「确认」"
+        LabyrinthSpecialEquipmentTap.EQUIP_CONFIRM -> "「装备确定」"
+        LabyrinthSpecialEquipmentTap.CANCEL -> "「取消」"
+    }
+
+    /**
+     * 「特别装备」本轮的执行钩子。返回 true 表示这一帧由本流程接管（已派发点击或正在等待），调用处
+     * 必须立刻 return，**不得**再产出任何编组执行步——三条开始战斗路径都由这一点统一切断。
+     *
+     * 返回 false 的三种情况都保持既有行为不变：
+     * 1. 本轮不适用（设置为「关闭」/ 本次战斗类型未勾选 / 不知道类型）；
+     * 2. 已经稳定地离开编组页（顺带清掉本轮标记，下次进入编组页是新的一轮）；
+     * 3. 本轮已经结束，而且编组页没有被弹窗挡住（放行开战）。
+     */
+    private fun handleSpecialEquipmentFlowFrame(
+        sessionId: AutomationSessionId,
+        result: LabyrinthEntryFrameResult,
+        timestampMillis: Long,
+    ): Boolean {
+        if (activeSessionId != sessionId) return false
+        val observation = result.specialEquipment
+        val pageState = result.observation.state
+        val dialogOpen = observation?.stage != null
+        val onTeamPage = pageState == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION
+
+        // 弹窗1/弹窗2 与 UNKNOWN 都不算离开编组页；只有**连续**若干帧落在别的页面才算「稳定
+        // 地离开」。单帧即清标记是错的：弹窗关合动画、Boss 切队、结算过渡都会插进来一两帧误分类，
+        // 那样会重新武装并在同一轮里再跑一遍。
+        //
+        // 这一支一律不吃帧（返回 false），UNKNOWN 也不例外。
+        // 它位于下面决策调用的前面，吃帧就等于把这一帧从两个上限体系里摘出去——本流程自己的 8s/3 次
+        // 上限根本走不到，而 2403-2408 的早返回又让 handlePostEntryPage（120s 停滞看门狗唯一推进的
+        // 地方）看不到它 ⇒ 又变回无界等待。交还帧就够：**标记保留**本身已经满足
+        // （UNKNOWN 不算离开、单帧不算离开），下一次看到真实页面再决定是否继续本轮。
+        if (!onTeamPage && !dialogOpen) {
+            specialEquipmentAwayFrames =
+                if (pageState == LabyrinthEntryPageState.UNKNOWN) 0 else specialEquipmentAwayFrames + 1
+            if (
+                specialEquipmentAwayFrames >= SPECIAL_EQUIPMENT_LEAVE_STABLE_FRAMES &&
+                specialEquipmentFlowStage != LabyrinthSpecialEquipmentFlowStage.INACTIVE
+            ) {
+                resetSpecialEquipmentRound()
+            }
+            return false
+        }
+        specialEquipmentAwayFrames = 0
+
+        // 设置关闭、或本次战斗类型未勾选时完全不介入——零点击、不新增等待、不新增中间态。
+        if (!specialEquipmentAppliesToCurrentBattle()) {
+            if (specialEquipmentFlowStage != LabyrinthSpecialEquipmentFlowStage.INACTIVE) {
+                resetSpecialEquipmentRound()
+            }
+            return false
+        }
+
+        // Boss 多队编组页的队伍标签切换**不是**同一轮：每个页签是一支独立的队伍，页签一变上一轮就
+        // 作废——让当前页签走完自己的一整轮（入口 → 自动装备 → 弹窗2 确认 → 装备确定/取消），上一个
+        // 页签的结束标记不再替它挡住穿戴。单队模式整段只跑一轮，页签不参与身份，行为不变。
+        //
+        // 只在上一轮**已经结束**（DONE）时才按页签重开：本轮还在走的时候被一帧误分类的页签打断，
+        // 就会回到「重新武装并在同一轮里再跑一遍」的老问题；在走的轮次本来也有 8s/3 次上限兜底。
+        val bossMultiTeamTab = onMultiTeamBossTab(result)
+        val bossTeamIndex = result.battleTeamSelection?.bossTeamIndex
+        if (
+            bossMultiTeamTab &&
+            specialEquipmentFlowStage == LabyrinthSpecialEquipmentFlowStage.DONE &&
+            specialEquipmentRoundBossTeamIndex != null &&
+            bossTeamIndex != specialEquipmentRoundBossTeamIndex
+        ) {
+            resetSpecialEquipmentRound()
+        }
+
+        // 武装：只在编组页且队伍页已稳定识别时武装一次。
+        if (specialEquipmentFlowStage == LabyrinthSpecialEquipmentFlowStage.INACTIVE) {
+            if (!onTeamPage) {
+                // 没有在编组页武装过就不启动（例如用户手动打开了这个弹窗）：只留一条诊断消息。
+                publishSpecialEquipmentMessage("特别装备：识别到弹窗，但本轮尚未在编组页武装，不自动点击")
+                return false
+            }
+            if (
+                result.battleTeamSelection?.recognitionState !=
+                LabyrinthBattleTeamRecognitionState.STABLE
+            ) {
+                return false
+            }
+// **推荐阵容就位之前不武装、更不得点入口**：成员槽还空着、总战力 0、画面中央是
+// 「请选择角色。」时点入口，游戏会弹「请选择角色。」，特别装备弹窗不会出现。
+//
+// 判据是编组计划的 teamReady（推荐阵容已全部就位），用法与 buildOverlayPresentation 一致，
+// 刻意**不**要求 5 人齐全：「保持当前队伍」的场景在 teamReady 变成 true 之后照常进入。
+// 未就绪就返回 false 把这一帧交还既有编组路径——它才负责把角色选上、把计划推到 ready。
+//
+// 入口 ROI 在实机帧上命中正确：圆形按钮位置与标定一致，还带点击反馈圈。
+//
+            if (_state.value.battleTeamSelectionPlan?.teamReady != true) return false
+            // Boss 多队模式下没有成员的页签没有可穿戴的对象：不武装、零点击，把帧交还给既有
+            // 「其余留空，开始挑战」路径。
+            if (bossMultiTeamTab && labyrinthSpecialEquipmentTeamIsEmpty(currentTeamCharacterIds(result))) {
+                return false
+            }
+            // 普通关卡与上一场普通战斗的编组完全相同 ⇒ 装备没变，跳过本轮：不武装、不点入口，
+            // 把帧交还给既有编组/开战路径，只留一条可诊断消息。
+            if (specialEquipmentTeamIsUnchanged(result)) {
+                publishSpecialEquipmentMessage("特别装备：本场编组与上一场普通战斗完全相同，跳过本次穿戴")
+                return false
+            }
+            specialEquipmentFlowStage = LabyrinthSpecialEquipmentFlowStage.AWAIT_ENTRY
+            specialEquipmentStepAttempts = 0
+            specialEquipmentStepStartedAt = timestampMillis
+            specialEquipmentRoundBossTeamIndex = bossTeamIndex.takeIf { bossMultiTeamTab }
+        }
+
+// 两态判定必须先**跨帧稳定**：这一帧的原始证据只用来推进连续
+        // 计数：只有连续 SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_FRAMES 帧同类证据才把结论交给决策，
+        // 首帧/过渡帧拿到的是 null ⇒ 决策只等一帧，既不点「装备确定」也不点「取消」。
+        val equipEvidence = labyrinthSpecialEquipmentEquipEvidenceStreak(
+            previous = specialEquipmentEquipEvidence,
+            observation = observation,
+        )
+        specialEquipmentEquipEvidence = equipEvidence
+
+        val decision = labyrinthSpecialEquipmentDecision(
+            stage = specialEquipmentFlowStage,
+            observation = observation,
+            stepAttempts = specialEquipmentStepAttempts,
+            stepElapsedMillis = if (specialEquipmentStepStartedAt == Long.MIN_VALUE) {
+                0L
+            } else {
+                (timestampMillis - specialEquipmentStepStartedAt).coerceAtLeast(0L)
+            },
+            equipConfirmEnabled = equipEvidence.confirmedEnabled,
+        )
+        // 只在本轮真正（武装后）看到过弹窗的帧上记账：用户手动打开的弹窗不引入任何新等待。
+        if (dialogOpen) specialEquipmentDialogObserved = true
+
+        // 结束但**带点击**的决策只有一种：超限逃生（点弹窗1 左下白色「取消」退回编组页）。
+        // 结束判定必须先落下（stage=DONE），否则下一帧的 DONE 决策不会再带上这次点击；点击本身记成
+        // 待办，等动作间隔到期补发——这是「记成待办再补发」的那一支，与下面「派发成功再提交」互补。
+        if (decision.finished) {
+            if (decision.abandoned) {
+                // 超限/放弃的**诊断原文**：后续帧不得用「本轮已结束，继续编组与开战」把它覆盖，
+                // 它同时决定停机文案该说「已放弃」还是「已正常结束」。
+                if (specialEquipmentDiagnostic == null) specialEquipmentDiagnostic = decision.message
+                specialEquipmentAbandoned = true
+            }
+            if (decision.tap != null) {
+                specialEquipmentPendingEscape = decision.tap
+                // 待办本身也有窗口：窗口内始终派发不出去（例如单动作锁一直被占）就放弃这次点击，
+                // 交给下面「本轮已结束但弹窗仍开着」的分支停机并保留诊断，不引入无界等待。
+                specialEquipmentEscapeDeadline =
+                    timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
+            }
+        }
+        if (
+            specialEquipmentPendingEscape != null &&
+            specialEquipmentEscapeDeadline != Long.MIN_VALUE &&
+            timestampMillis >= specialEquipmentEscapeDeadline
+        ) {
+            specialEquipmentPendingEscape = null
+        }
+
+        val tap = decision.tap ?: specialEquipmentPendingEscape
+        val rect = tap?.let { current -> observation?.let { labyrinthSpecialEquipmentTapRect(current, it) } }
+        val tapReady = rect != null && sessionActionIntervalElapsed(timestampMillis)
+        // **「决定要点击」不等于「点击已经派发」**：会话动作间隔（[BATTLE_TEAM_ACTION_INTERVAL_MILLIS]）
+        // 与单动作锁都可能把这一下挡在派发之前。此时若把 stage 推进到下一状态，就等于宣布「已经点过
+        // 了」——下一帧的决策会从下一状态继续等一个永远不会出现的画面，入口与「装备确定」都是这样丢的。
+        // 所以 stage 只在「本帧没有待派发的点击」或「待派发的点击确实派发成功」之后才提交；被挡下的
+        // 这一帧保持原 stage、步进次数与步进起点不变，间隔到期后同一决策会重新算出来补发**一次**。
+        // 补发同样受 [MAX_SPECIAL_EQUIPMENT_STEP_ATTEMPTS] 与 [SPECIAL_EQUIPMENT_STEP_TIMEOUT_MILLIS]
+        // 约束（次数只在真的派发时增加，超时按原来的步进起点计时），因此不会变成新的无界等待。
+        if (tap == null || decision.finished) {
+            commitSpecialEquipmentStage(decision, timestampMillis)
+        }
+        // 1) 有待派发的点击，但这一帧派不出去（动作间隔未到 / 矩形不可信）⇒ 只等，stage 不动
+        //    （结束决策的 DONE 与逃生待办已经落下了）。间隔到期后同一决策会再算出来补发。
+        if (tap != null && !tapReady) {
+            publishSpecialEquipmentMessage(
+                when {
+                    // 矩形可信 ⇒ 唯一的拦路者就是会话动作间隔。
+                    rect != null -> "特别装备：动作间隔未到，等待后补发点击${specialEquipmentTapName(tap)}"
+                    // 结束决策的待办在等矩形：诊断原文优先，别用「本轮已结束，继续编组与开战」盖掉超限原因。
+                    decision.finished -> specialEquipmentDiagnostic ?: decision.message
+                    else -> decision.message
+                },
+            )
+            return true
+        }
+
+        // 2) 没有待派发的点击。
+        if (tap == null) {
+            if (!decision.finished) {
+                // 3) 本轮还没结束：没有可信矩形就只等（不点候选位置）；
+                //    次数与时间上限都在决策函数里兜底。
+                publishSpecialEquipmentMessage(decision.message)
+                return true
+            }
+            if (!dialogOpen) {
+                // 编组页干净：把这一帧交还既有编组/开战路径（放行开战）。
+                // 交还帧时把逃生窗口一并收掉，否则 pendingEscape/escapeDeadline 会跨轮残留，
+                // 8s 窗口内若再出现弹窗就会多打一次「取消」。
+                specialEquipmentPendingEscape = null
+                specialEquipmentEscapeDeadline = Long.MIN_VALUE
+                publishSpecialEquipmentMessage(decision.message)
+                if (specialEquipmentDialogObserved) {
+                    // 本轮刚关掉过弹窗：把「关闭后的第一帧」让给关闭动画——这一刻点在「战斗开始」上
+                    // 会被动画吃掉。只让一帧，由 handleBattleTeamSelectionExecution 消费。
+                    specialEquipmentDialogObserved = false
+                    specialEquipmentModalCloseSettlePending = true
+                }
+                return false
+            }
+            // 本轮已结束、弹窗却仍开着，而且没有可以派发的逃生点击（待办已清或矩形不可信）。再吃帧就
+            // 变成「安静地永久停在编组页」：既逃不出弹窗也不停机、也没有「卡在哪一步」的诊断。
+            // 停机时必须保留超限诊断原文，不得用「本轮已结束，继续编组与开战」把它盖掉。
+            val diagnostic = specialEquipmentDiagnostic ?: decision.message
+            publishSpecialEquipmentMessage(diagnostic)
+            if (
+                specialEquipmentEscapeDeadline != Long.MIN_VALUE &&
+                timestampMillis < specialEquipmentEscapeDeadline
+            ) {
+                // 逃生点击已经派发出去，给它一个等弹窗关闭的窗口；窗口内不重复点击、也不停机。
+                return true
+            }
+            finishFromPlanner(
+                sessionId,
+                if (specialEquipmentAbandoned) {
+                    "特别装备：已放弃本轮且弹窗仍未关闭（无可用逃生矩形）；已停止并保留诊断状态；$diagnostic"
+                } else {
+                    // 本轮是**正常结束**（没有放弃诊断），不得把它误报成「超限放弃」。
+                    "特别装备：本轮已结束但弹窗仍开着且没有可用逃生矩形；已停止并保留诊断状态；$diagnostic"
+                },
+            )
+            return true
+        }
+
+        // 4) 有待派发的点击，而且这一帧满足派发条件 ⇒ **真的派发出去之后再提交 stage**。
+        publishSpecialEquipmentMessage(
+            if (decision.finished) specialEquipmentDiagnostic ?: decision.message else decision.message,
+        )
+        if (
+            !dispatchSpecialEquipmentAction(
+                sessionId = sessionId,
+                rect = requireNotNull(rect),
+                label = specialEquipmentTapLabel(tap),
+                timestampMillis = timestampMillis,
+            )
+        ) {
+            // 单动作锁被占：这一下没有落到画面上，与「动作间隔未到」同等处理——stage 不前进（结束决策
+            // 除外，它的 DONE 与逃生待办在前面的结束判定里已经落下），待办保留，下一次间隔到期后补发。
+            return true
+        }
+        if (!decision.finished) {
+            commitSpecialEquipmentStage(decision, timestampMillis)
+        }
+        if (decision.tap != null) {
+            specialEquipmentStepAttempts++
+        }
+        if (decision.finished) {
+            // 逃生点击**只点一次**——派发成功后立刻清待办，否则下一个动作间隔（≥1.2s）到来时残留的
+            // pendingEscape 会再点一次「取消」，与本段的语义和注释都不符。
+            specialEquipmentPendingEscape = null
+            specialEquipmentEscapeDeadline =
+                timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
+        }
+        return true
+    }
+
+    /**
+     * 提交决策给出的 stage（stage 变化时同时把步进次数与步进起点重置到本帧）。
+     *
+     * 只允许在「本帧没有待派发的点击」或「待派发的点击确实派发成功」之后调用：stage 的推进本身就
+     * 声明了「这一步的动作已经派发过」，在点击被会话节流或单动作锁挡下时提交它，会让下一帧的决策
+     * 从一个没人执行过的状态继续等下去。
+     */
+    private fun commitSpecialEquipmentStage(
+        decision: LabyrinthSpecialEquipmentDecision,
+        timestampMillis: Long,
+    ) {
+        if (decision.stage != specialEquipmentFlowStage) {
+            specialEquipmentStepAttempts = 0
+            specialEquipmentStepStartedAt = timestampMillis
+        }
+        specialEquipmentFlowStage = decision.stage
+    }
+
+    /**
+     * 会话级动作间隔：与编组执行步共用同一个节流时间戳，两个流程之间不得插队（见 [lastSessionActionAt]）。
+     */
+    private fun sessionActionIntervalElapsed(timestampMillis: Long): Boolean =
+        lastSessionActionAt == Long.MIN_VALUE ||
+            timestampMillis - lastSessionActionAt >= BATTLE_TEAM_ACTION_INTERVAL_MILLIS
+
+    /**
+     * 派发特别装备流程的一次点击。与 [dispatchBattleTeamAction] 同构（同一把单动作锁、同样的前台与
+     * 拒绝处置），但**用自己的时间戳与计数**，不触碰编组执行步的 key/attempts 语义。
+     *
+     * 动作坐标一律取「决策选中的按钮身份」在本帧观测里的矩形中心（[labyrinthSpecialEquipmentTapRect]），
+     * 因此不存在写死坐标，也不存在把「确认」派发到「装备确定」上的路径。
+     */
+    private fun dispatchSpecialEquipmentAction(
+        sessionId: AutomationSessionId,
+        rect: EntryPixelRect,
+        label: String,
+        timestampMillis: Long,
+    ): Boolean {
+        if (!beginGuardedAction()) return false
+        traceAction(label)
+        lastSessionActionAt = timestampMillis
+        launchGuardedAction {
+            val executor = actionExecutor
+            val action = AutomationAction.Tap(
+                ScreenPoint(rect.left + rect.width / 2f, rect.top + rect.height / 2f),
+            )
+            val actionResult = if (executor == null) {
+                AutomationActionResult.Rejected(action, "动作执行器不可用")
+            } else {
+                executor.execute(sessionId, action)
+            }
+            when (actionResult) {
+                is AutomationActionResult.Executed -> if (activeSessionId == sessionId) {
+                    val current = _state.value
+                    _state.value = current.copy(
+                        actionCount = current.actionCount + 1,
+                        lastActionLabel = label,
+                        message = "已执行：$label；等待画面确认",
+                    )
+                    overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
+                }
+                is AutomationActionResult.Rejected -> {
+                    if (actionResult.reason == GAME_NOT_FOREGROUND_REASON) {
+                        // 这一下没有落到游戏上，不算一次真实点击：丢掉节流戳，回前台后可以立刻重试
+                        // （与编组执行步被拒时的处置一致）。
+                        lastSessionActionAt = Long.MIN_VALUE
+                        publishWaitingForGameForeground(sessionId)
+                    } else {
+                        stopFromRunLogic("特别装备动作被拒绝：${actionResult.reason}")
+                    }
+                }
+                AutomationActionResult.StaleSession -> Unit
+                AutomationActionResult.Paused -> Unit
+                is AutomationActionResult.DryRun -> Unit
+            }
+        }
+        return true
     }
 
     private fun dispatchBattleTeamAction(
@@ -5892,6 +6685,12 @@ class LabyrinthEntryRecognitionSession(
         battleRetryCount = 0
         synchronized(currentBattleTeamSignatures) { currentBattleTeamSignatures.clear() }
         synchronized(failedBattleTeamSignatures) { failedBattleTeamSignatures.clear() }
+        // 提交与签名是一体的：只清签名会把两者留在不一致的状态（提交还在、签名没了），下一次失败重试
+        // 就再也对不上这一队的失败记录。
+        synchronized(committedBattleCharacterIds) { committedBattleCharacterIds.clear() }
+        pendingBattleTeamAction = null
+        battleTeamActionUnconfirmedAttempts = 0
+        battleTeamActionStopReason = null
     }
 
     private fun postEntryIsRoleRewardPage(result: LabyrinthEntryFrameResult): Boolean {
@@ -6264,6 +7063,16 @@ class LabyrinthEntryRecognitionSession(
         lastBattleTeamRecommendationKey = null
         lastBattleTeamSelectionPlanLog = null
         resetBattleTeamExecutionTracking()
+        // 会话/账号边界：特别装备轮次与「上一场普通战斗的编组记忆」都属于**这一次运行**的状态。
+        // 应用复用同一个会话对象跑下一个账号，不能把上一轮的 stage（可能正停在 DONE，于是新账号的
+        // 第一场直接跳过穿戴）、旧轮次的超时起点、或上一场的普通编组记忆带过去。
+        // 这条重置只在 start()/stop() 走这里，普通战斗之间不会触发，所以「编组未变则跳过」照常生效。
+        resetSpecialEquipmentRound()
+        lastNormalBattleTeamSignature = null
+        pendingBattleTeamAction = null
+        battleTeamActionUnconfirmedAttempts = 0
+        battleTeamActionStopReason = null
+        battleTeamPageStallSince = Long.MIN_VALUE
         synchronized(committedBattleCharacterIds) { committedBattleCharacterIds.clear() }
         resetBattleRetryTracking()
         bossEditorTeamIndex = null
@@ -8702,6 +9511,17 @@ class LabyrinthEntryRecognitionSession(
         const val MAX_POST_ENTRY_ATTEMPTS = 6
         const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 1_200L
         const val BATTLE_TEAM_CHARACTER_FEEDBACK_TIMEOUT_MILLIS = 4_000L
+        /**
+         * 「编组页动作派发后，画面还允许原地不动多久」。
+         *
+         * 取值 4 秒的依据：必须**大于** [LabyrinthBattleWaitPolicy] 自己的 3 秒「注入后可能还是旧编组页」
+         * 宽限，否则一次慢一点的正常切换会被误判成「没被收下」；实机帧率约 600ms 一帧，4 秒保证了宽限
+         * 过后至少还有一帧可判；而真正被吞掉的那一下在实机上是十几秒原地不动，4 秒离它很远。
+         * 总的可重试次数由 [MAX_BATTLE_TEAM_ACTION_UNCONFIRMED] 兜底。
+         */
+        const val BATTLE_TEAM_ACTION_ACK_TIMEOUT_MILLIS = 4_000L
+        /** 连续多少次「编组页动作派发后画面没动」就停机（每次之间都重新规划并重发，不是静默等待）。 */
+        const val MAX_BATTLE_TEAM_ACTION_UNCONFIRMED = 3
         const val MAX_BATTLE_TEAM_STEP_ATTEMPTS = 3
         const val MAX_BATTLE_TEAM_SCROLL_ACTIONS = 48
         const val MAX_EFFECTIVE_SCAN_SCROLL_ACTIONS = 48
@@ -8734,3 +9554,14 @@ private const val SESSION_RETURN_TITLE_MIN_SCORE = 0.45
 private const val SESSION_DATE_CHANGE_TITLE_MIN_SCORE = 0.72
 private const val SESSION_DATE_CHANGE_CONFIRM_MIN_SCORE = 0.55
 private const val NODE_VIEWPORT_SIGNATURE_BUCKET_PX = 32
+
+/**
+ * 连续多少帧落在非编组页才算「稳定地离开编组页」。
+ *
+ * 取 2 与 `POST_ENTRY_STABLE_FRAMES` / `SESSION_BLOCK_STABLE_FRAMES` 同量级：弹窗关合动画、Boss 切队、
+ * 战斗结算过渡都会插进来一两帧误分类，而 UNKNOWN 根本不累计。
+ */
+internal const val SPECIAL_EQUIPMENT_LEAVE_STABLE_FRAMES = 2
+
+/** 超限逃生点击（点弹窗1「取消」）之后等弹窗关闭的上限；超期仍未关就停机并保留诊断。 */
+internal const val SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS = 8_000L

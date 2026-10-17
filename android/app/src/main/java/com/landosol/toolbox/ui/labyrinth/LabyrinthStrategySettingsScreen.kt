@@ -3,6 +3,7 @@ package com.landosol.toolbox.ui.labyrinth
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -10,13 +11,16 @@ import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.landosol.toolbox.labyrinth.LabyrinthBossTeamMode
+import com.landosol.toolbox.labyrinth.LabyrinthCombatKind
 import com.landosol.toolbox.labyrinth.LabyrinthRelicMark
+import com.landosol.toolbox.labyrinth.LabyrinthSpecialEquipmentMode
 import com.landosol.toolbox.labyrinth.LabyrinthStrategySettings
 import com.landosol.toolbox.labyrinth.LabyrinthStrategySettingsCodec
 import com.landosol.toolbox.labyrinth.LabyrinthRoleRatingItem
@@ -61,7 +65,7 @@ fun LabyrinthStrategySettingsScreen(
                     Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp)) {
                         Text(draft.validationError() ?: message ?: if (draft == saved) "配置已保存；下次启动生效" else "有未保存的修改",
                             style = MaterialTheme.typography.bodySmall)
-                        Button(onClick = { onSave(draft) }, enabled = !saving && draft.validationError() == null && draft != saved,
+                        Button(onClick = { onSave(draft) }, enabled = draft.canSaveDraft(saved, saving),
                             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
                             Text(if (saving) "正在保存…" else "保存配置")
                         }
@@ -216,6 +220,49 @@ fun LabyrinthStrategySettingsScreen(
                     StrategyNumber("普通战估计胜率", draft.normalWinRate, 0..100, "%", !saving) { draft = draft.copy(normalWinRate = it) }
                     StrategyNumber("极难战估计胜率", draft.extremeWinRate, 0..100, "%", !saving) { draft = draft.copy(extremeWinRate = it) }
                 }
+                StrategySection("特别装备", specialEquipmentSummary(draft), section, { section = it }) {
+                    Text(
+                        "自动穿戴会在队伍编组页点开「特别装备」并尝试自动穿戴，只对下面勾选的关卡类型生效；" +
+                            "是否执行按本次启动读取的设置快照判定，运行中保存只影响下一次启动。",
+                    )
+                    StrategyRadioChoice(
+                        label = "关闭",
+                        detail = "默认。本次编组页不会为特别装备产生任何额外点击。",
+                        selected = draft.specialEquipmentMode == LabyrinthSpecialEquipmentMode.OFF,
+                        enabled = !saving,
+                    ) { draft = draft.copy(specialEquipmentMode = LabyrinthSpecialEquipmentMode.OFF) }
+                    StrategyRadioChoice(
+                        label = "自动穿戴",
+                        detail = "只在队伍编组页执行，且仅限下面勾选的关卡类型。",
+                        selected = draft.specialEquipmentMode == LabyrinthSpecialEquipmentMode.AUTO_EQUIP,
+                        enabled = !saving,
+                    ) { draft = draft.copy(specialEquipmentMode = LabyrinthSpecialEquipmentMode.AUTO_EQUIP) }
+                    if (draft.specialEquipmentMode == LabyrinthSpecialEquipmentMode.AUTO_EQUIP) {
+                        Text("需要自动穿戴的关卡类型（可同时勾选，至少勾选一个）：")
+                        LabyrinthCombatKind.entries.forEach { kind ->
+                            StrategyCheckChoice(
+                                label = kind.specialEquipmentLabel(),
+                                checked = draft.autoEquipsSpecialEquipment(kind),
+                                enabled = !saving,
+                            ) { checked ->
+                                draft = draft.copy(
+                                    specialEquipmentKinds = if (checked) {
+                                        draft.specialEquipmentKinds + kind
+                                    } else {
+                                        draft.specialEquipmentKinds - kind
+                                    },
+                                )
+                            }
+                        }
+                        if (draft.specialEquipmentKinds.isEmpty()) {
+                            Text(
+                                LabyrinthStrategySettings.SPECIAL_EQUIPMENT_EMPTY_KINDS_ERROR,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                }
                 Text("识别置信度、资料完整性、游戏属性档位和操作安全检查保持原规则，不随偏好配置关闭。",
                     style = MaterialTheme.typography.bodySmall)
             }
@@ -254,6 +301,25 @@ fun LabyrinthStrategySettingsScreen(
 
 private fun relicPrioritySummary(priority: List<LabyrinthRelicMark>): String =
     if (priority.isEmpty()) "使用内置顺序" else priority.joinToString(" > ") { it.label }
+
+/** 只把关卡类型翻成界面文案；取值仍是 [LabyrinthCombatKind] 本身，不另造枚举或映射表。 */
+private fun LabyrinthCombatKind.specialEquipmentLabel(): String = when (this) {
+    LabyrinthCombatKind.NORMAL -> "普通"
+    LabyrinthCombatKind.EX -> "EX"
+    LabyrinthCombatKind.BOSS -> "BOSS"
+}
+
+/**
+ * 分组摘要必须与实际执行读同一份字段和同一个判据：勾选状态来自
+ * [LabyrinthStrategySettings.autoEquipsSpecialEquipment]，不在界面里另写一套规则。
+ */
+private fun specialEquipmentSummary(settings: LabyrinthStrategySettings): String =
+    if (settings.specialEquipmentMode == LabyrinthSpecialEquipmentMode.OFF) {
+        "关闭（默认）"
+    } else {
+        val kinds = LabyrinthCombatKind.entries.filter { settings.autoEquipsSpecialEquipment(it) }
+        "自动穿戴 · " + if (kinds.isEmpty()) "未选择关卡类型" else kinds.joinToString("、") { it.specialEquipmentLabel() }
+    }
 
 @Composable
 private fun RelicPriorityEditor(
@@ -313,6 +379,26 @@ private fun StrategyRadioChoice(
             Text(label)
             Text(detail, style = MaterialTheme.typography.bodySmall)
         }
+    }
+}
+
+@Composable
+private fun StrategyCheckChoice(
+    label: String,
+    checked: Boolean,
+    enabled: Boolean,
+    change: (Boolean) -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp)
+            .toggleable(value = checked, enabled = enabled, role = Role.Checkbox, onValueChange = change)
+            .semantics { contentDescription = label },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(checked = checked, onCheckedChange = null, enabled = enabled)
+        Text(label, Modifier.weight(1f))
     }
 }
 

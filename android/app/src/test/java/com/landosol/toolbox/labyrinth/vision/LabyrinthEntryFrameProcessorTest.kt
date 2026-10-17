@@ -1214,6 +1214,20 @@ class LabyrinthEntryFrameProcessorTest {
                 File(assetRoot, "battle_team_selection/battle_team_selection_cancel_button.png"),
             EntryAnchorId.BATTLE_TEAM_START_BUTTON to
                 File(assetRoot, "battle_team_selection/battle_team_selection_start_button.png"),
+            EntryAnchorId.BATTLE_TEAM_SPECIAL_EQUIPMENT_BUTTON to
+                File(assetRoot, "special_equipment/special_equipment_battle_team_button.png"),
+            EntryAnchorId.SPECIAL_EQUIPMENT_DIALOG_ANCHOR to
+                File(assetRoot, "special_equipment/special_equipment_dialog_anchor.png"),
+            EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_BUTTON to
+                File(assetRoot, "special_equipment/special_equipment_auto_button.png"),
+            EntryAnchorId.SPECIAL_EQUIPMENT_EQUIP_CONFIRM_ENABLED to
+                File(assetRoot, "special_equipment/special_equipment_equip_confirm_enabled.png"),
+            EntryAnchorId.SPECIAL_EQUIPMENT_EQUIP_CONFIRM_DISABLED to
+                File(assetRoot, "special_equipment/special_equipment_equip_confirm_disabled.png"),
+            EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_ANCHOR to
+                File(assetRoot, "special_equipment/special_equipment_auto_dialog_anchor.png"),
+            EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_CONFIRM_BUTTON to
+                File(assetRoot, "special_equipment/special_equipment_auto_dialog_confirm_button.png"),
             EntryAnchorId.SESSION_ERROR_TITLE to File(uiRoot, "错误提示/错误提示.bmp"),
             EntryAnchorId.SESSION_RETURN_TITLE to File(uiRoot, "错误提示/返回标题.bmp"),
             EntryAnchorId.SESSION_DATE_CHANGE_TITLE to File(assetRoot, "session_date_change_title.png"),

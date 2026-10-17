@@ -9,6 +9,21 @@ enum class LabyrinthBossTeamMode {
     SINGLE_TEAM,
 }
 
+/**
+ * 「特别装备」自动穿戴模式（语义见 `android/docs/special-equipment.md`）。
+ *
+ * 只有 [AUTO_EQUIP] 才可能触发「队伍编组页 → 特别装备设定 → 自动特别装备设定」流程；[OFF] 是
+ * 默认值，自动执行对它产生 0 次额外点击。
+ */
+@Serializable
+enum class LabyrinthSpecialEquipmentMode {
+    /** 关闭（默认）：不自动穿戴特别装备。 */
+    OFF,
+
+    /** 自动穿戴：只有本次战斗的关卡类型在 [LabyrinthStrategySettings.specialEquipmentKinds] 内才执行。 */
+    AUTO_EQUIP,
+}
+
 /** User preferences only: game facts and recognition safety thresholds are not editable. */
 @Serializable
 data class LabyrinthStrategySettings(
@@ -60,8 +75,21 @@ data class LabyrinthStrategySettings(
      * immediately still wins regardless of order.
      */
     val relicMarkPriority: List<LabyrinthRelicMark> = emptyList(),
+    /** 特别装备模式；默认 [LabyrinthSpecialEquipmentMode.OFF]，旧配置缺字段时同样得到「关闭」。 */
+    val specialEquipmentMode: LabyrinthSpecialEquipmentMode = LabyrinthSpecialEquipmentMode.OFF,
+    /**
+     * 需要自动穿戴特别装备的关卡类型，取值就是既有的 [LabyrinthCombatKind]：普通 = NORMAL、
+     * EX = EX、BOSS = BOSS），不另造第二套枚举或字符串。
+     *
+     * 默认三类全选：一旦选中「自动穿戴」就必须有可执行的关卡类型，空集合是校验错误。
+     * 这个集合是**显式**的——空集合在执行侧一律解释为「不执行」，绝不等价于「全部关卡」。
+     */
+    val specialEquipmentKinds: Set<LabyrinthCombatKind> =
+        setOf(LabyrinthCombatKind.NORMAL, LabyrinthCombatKind.EX, LabyrinthCombatKind.BOSS),
 ) {
     fun validationError(): String? = when {
+        specialEquipmentMode == LabyrinthSpecialEquipmentMode.AUTO_EQUIP && specialEquipmentKinds.isEmpty() ->
+            SPECIAL_EQUIPMENT_EMPTY_KINDS_ERROR
         listOf(playerWeight, damageWeight, survivalWeight, functionWeight, formationWeight,
             cohesionWeight, secondTeamWeight, thirdTeamWeight, normalWinRate, extremeWinRate)
             .any { it !in 0..100 } -> "权重和胜率必须在 0–100 之间"
@@ -126,6 +154,31 @@ data class LabyrinthStrategySettings(
         baselineLastArea = baselineLastArea,
         markPriority = relicMarkPriority.distinct(),
     ))
+
+    /**
+     * 单一判据：本次战斗的关卡类型是否需要自动穿戴特别装备。
+     *
+     * 设置页里三个多选项的勾选状态和自动执行的触发判定都必须调用本函数，不得各自复写一份规则。
+     * 空集合在这里返回 false —— 即「不执行」，而不是「全部关卡」。
+     */
+    fun autoEquipsSpecialEquipment(kind: LabyrinthCombatKind): Boolean =
+        specialEquipmentMode == LabyrinthSpecialEquipmentMode.AUTO_EQUIP && kind in specialEquipmentKinds
+
+    /**
+     * 设置页「保存配置」按钮的启用判据：草稿校验通过、与已保存配置不同、且不在保存中。
+     * 界面直接调用它，单测钉住同一份表达式，避免界面判定与写入判定分叉。
+     */
+    internal fun canSaveDraft(saved: LabyrinthStrategySettings, saving: Boolean): Boolean =
+        !saving && validationError() == null && this != saved
+
+    companion object {
+        /**
+         *勾选「自动穿戴」却一个关卡类型都没勾选时的中文错误文案。
+         * 设置页提示与单测引用同一常量，避免文案各自漂移。
+         */
+        const val SPECIAL_EQUIPMENT_EMPTY_KINDS_ERROR =
+            "已开启特别装备自动穿戴，请至少勾选一个关卡类型（普通/EX/BOSS）"
+    }
 }
 
 /** Read one immutable snapshot at session start; saving never mutates a running planner. */

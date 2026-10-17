@@ -1125,6 +1125,78 @@
       "height": 80,
       "sha256": "bab2df20c2da33eb72d587da26a25fdf9b498c6b1b2d8318fec6484f66d6f05f",
       "anchor": "shop"
+    },
+    {
+      "id": "entry.battle_team.special_equipment_button",
+      "file": "vision/special_equipment/special_equipment_battle_team_button.png",
+      "kind": "template",
+      "width": 97,
+      "height": 97,
+      "sha256": "98ab70f1aabadcd66b797500da3a72d7246d8fa700b3d6bc1f05e75b317b5c67",
+      "anchor": "battle_team_selection"
+    },
+    {
+      "id": "entry.special_equipment.dialog_anchor",
+      "file": "vision/special_equipment/special_equipment_dialog_anchor.png",
+      "kind": "template",
+      "width": 50,
+      "height": 58,
+      "sha256": "61ded0a2ebb72096d003a8238f983bb8540f5b0d38e384eb724d5f78083a61f0",
+      "anchor": "special_equipment"
+    },
+    {
+      "id": "entry.special_equipment.dialog_title",
+      "file": "vision/special_equipment/special_equipment_dialog_title.png",
+      "kind": "template",
+      "width": 264,
+      "height": 54,
+      "sha256": "698538fddc16e34adc096eb84faf7cdef258db897f70991ec6c87ba3abe1ed74",
+      "anchor": "special_equipment"
+    },
+    {
+      "id": "entry.special_equipment.auto_button",
+      "file": "vision/special_equipment/special_equipment_auto_button.png",
+      "kind": "template",
+      "width": 387,
+      "height": 71,
+      "sha256": "0814804e61b3781bcf1016efa83166d2252ebb7e0a4de95fa8f60951591ee920",
+      "anchor": "special_equipment"
+    },
+    {
+      "id": "entry.special_equipment.equip_confirm_enabled",
+      "file": "vision/special_equipment/special_equipment_equip_confirm_enabled.png",
+      "kind": "template",
+      "width": 396,
+      "height": 81,
+      "sha256": "23d0648ea651f890dbfb7c87d48012006003ebf5e2a1a074c62cae4304454006",
+      "anchor": "special_equipment"
+    },
+    {
+      "id": "entry.special_equipment.equip_confirm_disabled",
+      "file": "vision/special_equipment/special_equipment_equip_confirm_disabled.png",
+      "kind": "template",
+      "width": 396,
+      "height": 81,
+      "sha256": "9fb02ffe273cb18ec21703596573b15f087bd918d76739acd52cdf4ea331899e",
+      "anchor": "special_equipment"
+    },
+    {
+      "id": "entry.special_equipment.auto_dialog_anchor",
+      "file": "vision/special_equipment/special_equipment_auto_dialog_anchor.png",
+      "kind": "template",
+      "width": 400,
+      "height": 58,
+      "sha256": "94fe8acdefb1028c1c7b96a62e255a4244ad4e7c5d4422b6210049e388f7e69b",
+      "anchor": "special_equipment"
+    },
+    {
+      "id": "entry.special_equipment.auto_dialog_confirm_button",
+      "file": "vision/special_equipment/special_equipment_auto_dialog_confirm_button.png",
+      "kind": "template",
+      "width": 396,
+      "height": 91,
+      "sha256": "d4206c72423f5a60d62f023a28999016f9f23ee6aba64717c9e7b03a20778b6e",
+      "anchor": "special_equipment"
     }
   ]
 }

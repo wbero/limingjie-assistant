@@ -9,6 +9,12 @@ class AndroidLabyrinthRelicDetailResolver(
     private val ocr = AndroidRelicRoiOcr(submitTextRead)
 
     fun resolve(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {
+        // 「特别装备设定 / 自动特别装备设定」也是白色面板加蓝色标题带，只凭面板外观（四个白角）
+        // 就会被当成系列面板把帧抢走；这类帧已由特别装备识别器给出 stage，直接交还：不 hold、不 OCR。
+        if (labyrinthSpecialEquipmentOwnsFrame(result)) {
+            ocr.clear()
+            return result
+        }
         if (result.observation.state !in setOf(LabyrinthEntryPageState.UNKNOWN,
                 LabyrinthEntryPageState.NODE_SELECTION, LabyrinthEntryPageState.NODE_MAP_VIEW) ||
             !looksLikeSeriesPanel(bitmap)) {

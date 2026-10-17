@@ -122,6 +122,22 @@ class AndroidLabyrinthEntryTemplateLoader(
                 "$ROOT/battle_team_selection/battle_team_selection_cancel_button.png",
             EntryAnchorId.BATTLE_TEAM_START_BUTTON to
                 "$ROOT/battle_team_selection/battle_team_selection_start_button.png",
+            EntryAnchorId.BATTLE_TEAM_SPECIAL_EQUIPMENT_BUTTON to
+                "$ROOT/special_equipment/special_equipment_battle_team_button.png",
+            EntryAnchorId.SPECIAL_EQUIPMENT_DIALOG_ANCHOR to
+                "$ROOT/special_equipment/special_equipment_dialog_anchor.png",
+            EntryAnchorId.SPECIAL_EQUIPMENT_DIALOG_TITLE to
+                "$ROOT/special_equipment/special_equipment_dialog_title.png",
+            EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_BUTTON to
+                "$ROOT/special_equipment/special_equipment_auto_button.png",
+            EntryAnchorId.SPECIAL_EQUIPMENT_EQUIP_CONFIRM_ENABLED to
+                "$ROOT/special_equipment/special_equipment_equip_confirm_enabled.png",
+            EntryAnchorId.SPECIAL_EQUIPMENT_EQUIP_CONFIRM_DISABLED to
+                "$ROOT/special_equipment/special_equipment_equip_confirm_disabled.png",
+            EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_ANCHOR to
+                "$ROOT/special_equipment/special_equipment_auto_dialog_anchor.png",
+            EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_CONFIRM_BUTTON to
+                "$ROOT/special_equipment/special_equipment_auto_dialog_confirm_button.png",
             EntryAnchorId.SESSION_ERROR_TITLE to "$ROOT/session_error_title.bmp",
             EntryAnchorId.SESSION_RETURN_TITLE to "$ROOT/session_return_title.bmp",
             EntryAnchorId.SESSION_DATE_CHANGE_TITLE to "$ROOT/session_date_change_title.png",
