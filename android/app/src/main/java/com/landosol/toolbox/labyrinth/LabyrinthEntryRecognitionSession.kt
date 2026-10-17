@@ -1311,6 +1311,10 @@ class LabyrinthEntryRecognitionSession(
     private var pendingRelicSelection: LabyrinthRelicMatch? = null
     @Volatile
     private var relicChoiceCommitted = false
+    /** When [relicChoiceCommitted] was last set, for the lost-tap retry (see [labyrinthSelectionCommitExpired]). */
+    private var relicChoiceCommittedAt = Long.MIN_VALUE
+    /** How many times a lost relic tap has already been retried this round. */
+    private var relicChoiceCommitAttempts = 0
     private val relicAcquisitionGate = LabyrinthRelicAcquisitionGate()
     @Volatile
     private var eventChoiceCommitted = false
@@ -2818,6 +2822,8 @@ class LabyrinthEntryRecognitionSession(
             relicStackLedger.clear()
             pendingRelicSelection = null
             relicChoiceCommitted = false
+            relicChoiceCommittedAt = Long.MIN_VALUE
+            relicChoiceCommitAttempts = 0
             actionScope.launch {
                 runCatching {
                     persistenceMutex.withLock { store.startNew(accountId, timestampMillis) }
@@ -2889,6 +2895,8 @@ class LabyrinthEntryRecognitionSession(
             pendingRelicSelection.also {
                 pendingRelicSelection = null
                 relicChoiceCommitted = false
+                relicChoiceCommittedAt = Long.MIN_VALUE
+                relicChoiceCommitAttempts = 0
                 relicAcquisitionGate.reset()
             }
         } else {
@@ -4623,6 +4631,8 @@ class LabyrinthEntryRecognitionSession(
             if (pageState == LabyrinthEntryPageState.RELIC_CHOICE) {
                 pendingRelicSelection = null
                 relicChoiceCommitted = false
+                relicChoiceCommittedAt = Long.MIN_VALUE
+                relicChoiceCommitAttempts = 0
             }
             if (pageState == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) {
                 resetBattleTeamExecutionTracking()
@@ -5124,9 +5134,31 @@ class LabyrinthEntryRecognitionSession(
                 }
 
             LabyrinthEntryPageState.RELIC_CHOICE -> {
-                if (relicChoiceCommitted) {
+                if (relicChoiceCommitted &&
+                    !labyrinthSelectionCommitExpired(relicChoiceCommittedAt, timestampMillis)
+                ) {
+                    null
+                } else if (relicChoiceCommitted &&
+                    relicChoiceCommitAttempts >= MAX_SELECTION_COMMIT_ATTEMPTS
+                ) {
+                    finishFromPlanner(
+                        sessionId,
+                        "遗物选择已点击${relicChoiceCommitAttempts}次仍停留在遗物页；停止以免反复空点",
+                    )
                     null
                 } else {
+                    if (relicChoiceCommitted) {
+                        // The tap was sent and the page never moved on. The latch used to clear
+                        // only on a page change, and the page was the thing that never changed, so
+                        // the run sat until the page-stall watchdog ended it (2026-10-12 bundles:
+                        // 120 s on one RELIC_CHOICE page with actionCount frozen). Re-arm and retry
+                        // now that the tap is provably lost.
+                        relicChoiceCommitted = false
+                        relicChoiceCommittedAt = Long.MIN_VALUE
+                        relicChoiceCommitAttempts++
+                        pendingRelicSelection = null
+                        nodeLog("relic-choice-retry attempts=$relicChoiceCommitAttempts", warning = true)
+                    }
                     relicChoicePolicy.choose(
                         acquired = _state.value.observedRelics,
                         candidates = result.relicChoiceSelection?.choices.orEmpty(),
@@ -6013,6 +6045,7 @@ class LabyrinthEntryRecognitionSession(
                     }
                     if (kind == LabyrinthPostEntryActionKind.SELECT_RELIC) {
                         relicChoiceCommitted = true
+                        relicChoiceCommittedAt = clock()
                     }
                     if (kind == LabyrinthPostEntryActionKind.SELECT_ROLE_REWARD) {
                         roleRewardChoiceCommitted = true
@@ -6252,6 +6285,8 @@ class LabyrinthEntryRecognitionSession(
         resetPostEntryStall()
         pendingRelicSelection = null
         relicChoiceCommitted = false
+        relicChoiceCommittedAt = Long.MIN_VALUE
+        relicChoiceCommitAttempts = 0
         relicFocusMark = null
         relicStackLedger.clear()
         clearCharacterAcquisitionContext()
@@ -8665,7 +8700,12 @@ class LabyrinthEntryRecognitionSession(
         const val TEAM_RECOMMENDATION_LOG_TAG = "LabyrinthTeamPlan"
         const val TEAM_SELECTION_PLAN_LOG_TAG = "LabyrinthTeamSelection"
         const val OWNER = "labyrinth-entry-recognition"
-        const val FRAME_INTERVAL_MILLIS = 500L
+
+        // Matches the capture cadence (MediaProjectionCaptureService.FRAME_INTERVAL_MILLIS = 300).
+        // Frames land on 0/300/600/900..., so the old 500 ms gate accepted 0, dropped 300, accepted
+        // 600 - pinning the recognition cadence at 600 ms while capture kept producing a 300 ms
+        // frame that was thrown away. 300 keeps every frame capture already paid to convert.
+        const val FRAME_INTERVAL_MILLIS = 300L
         const val FIRST_FRAME_TIMEOUT_MILLIS = 5_000L
         const val NODE_CLICK_STABLE_FRAMES = 3
         /** How long a strong FULL_COLUMN target rect outranks weaker re-bindings without a gesture. */
@@ -8694,13 +8734,20 @@ class LabyrinthEntryRecognitionSession(
         const val POST_ENTRY_ACTION_INTERVAL_MILLIS = 1_500L
 
         const val MAX_EVENT_CHOICE_COMMIT_ATTEMPTS = 3
+        /** Lost-tap retries allowed on a single-pick choice page before the run stops. */
+        const val MAX_SELECTION_COMMIT_ATTEMPTS = 3
         const val SHOP_PURCHASE_TRANSITION_TIMEOUT_MILLIS = 8_000L
         const val SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS = 8_000L
         const val SHOP_REFRESH_SETTLE_MILLIS = 500L
         const val CHARACTER_ACQUISITION_ACTION_INTERVAL_MILLIS = 650L
         const val NODE_MAP_SETTLE_AFTER_POST_ACTION_MILLIS = 2_000L
         const val MAX_POST_ENTRY_ATTEMPTS = 6
-        const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 1_200L
+        // Click-spam guard between two battle-team actions. Halved from 1200 ms: at the 600 ms frame
+        // cadence 1200 ms forced a two-frame wait and, with the confirmation frame on top, made every
+        // team-editor action cost three frames (1.85 s). 600 ms is one frame at the 300 ms cadence.
+        // The guard's structure is untouched -- only the threshold moved -- and an on-device A/B
+        // decides whether the game still keeps up (the gesture cancel/reject counters must stay 0).
+        const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 600L
         const val BATTLE_TEAM_CHARACTER_FEEDBACK_TIMEOUT_MILLIS = 4_000L
         const val MAX_BATTLE_TEAM_STEP_ATTEMPTS = 3
         const val MAX_BATTLE_TEAM_SCROLL_ACTIONS = 48
