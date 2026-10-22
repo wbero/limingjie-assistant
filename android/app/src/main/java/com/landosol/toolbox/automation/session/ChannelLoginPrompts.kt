@@ -15,8 +15,8 @@ import com.landosol.toolbox.protocol.bilibili.GameServer
  *
  * - 九游：标题页上弹出「登录历史」对话框，列出最近登录的游戏号，点账号条目才继续登录。
  * - vivo：竖屏 UnionActivity 网页自动登录，约 4 秒后自己回到游戏，不需要点击。
- * - 4399 / 应用宝 / MuMu：不在这里点，改为刷开局前大退（[ChannelSdkTraits.closesClientBeforeReroll]），
- *   让渠道 SDK 不走登出、冷启动时静默登录。
+ * - 4399 / 应用宝 / MuMu / 九游：不在这里点，改为刷开局后重建任务栈
+ *   ([ChannelSdkTraits.requiresTaskResetBeforeReroll])，让入口流程从 SplashActivity 开始。
  *
  * 这些都是 SDK 画的安卓控件，不是 Unity 画面，游戏 UI 模板认不出来；但无障碍节点树能直接读到
  * 文字。所以这里只按文字认：同一窗口里必须同时出现标题文字和目标按钮文字，窗口包名必须属于
@@ -146,17 +146,15 @@ object ChannelSdkTraits {
         server == GameServer.CN_VIVO || server == GameServer.CN_4399 || server == GameServer.CN_ALIGAMES
 
     /**
-     * The game is hard-closed before the assistant logs in to reroll, and cold-started afterwards.
-     *
-     * Logging in from the assistant takes the account's game session (顶号). A client that then
-     * meets 6002 and goes 返回标题 logs its channel SDK out: 4399 re-shows its agreement and asks
-     * for authorization (2026-10-14 diag: `Back_To_Title` → `operate User not Valid`), 应用宝 and
-     * MuMu ask for the account password again. A process that is killed instead never runs that
-     * logout, and the SDK signs in silently on the next cold start. Sending the game to the
-     * background is not enough: relaunching a live process also takes it 返回标题.
+     * These channels restart the game task after assistant-side login, avoiding the normal
+     * session-expiry-to-title flow that was observed to log their SDK out. CLEAR_TASK | NEW_TASK
+     * resets the Activity task but does not guarantee process termination.
      */
-    fun closesClientBeforeReroll(server: GameServer?): Boolean =
-        server == GameServer.CN_4399 || server == GameServer.CN_TENCENT || server == GameServer.CN_MUMU
+    fun requiresTaskResetBeforeReroll(server: GameServer?): Boolean =
+        server == GameServer.CN_4399 ||
+            server == GameServer.CN_TENCENT ||
+            server == GameServer.CN_MUMU ||
+            server == GameServer.CN_ALIGAMES
 }
 
 object ChannelLoginPromptMatcher {

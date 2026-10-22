@@ -213,8 +213,8 @@ class LabyrinthController(
     private val launchForeground: () -> Unit,
     /**
      * Runs before a reroll logs in to the game server. Returns a failure message to abort the
-     * reroll, or null to go on. The application uses it to hard-close channel clients whose SDK
-     * logs out when the client is taken over (ChannelSdkTraits.closesClientBeforeReroll).
+     * reroll, or null to go on. The application backgrounds selected channel clients and later
+     * restarts their task stack to avoid the normal session-expiry title flow.
      */
     private val beforeRerollLogin: suspend (accountId: Long) -> String? = { null },
     /** Runs after a standalone (non-batch) reroll ends; the batch cold-starts the client itself. */
