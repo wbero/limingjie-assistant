@@ -457,6 +457,10 @@ internal const val POST_ENTRY_STALL_TIMEOUT_MILLIS = 120_000L
  */
 internal const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 600L
 
+/** 任意节点编号 → 它所属的区域（1~5）；万位不合法时返回 null。 */
+internal fun labyrinthNodeAreaOf(blockId: Long?): Int? =
+    blockId?.let { (it / 10_000).toInt().takeIf { area -> area in 1..5 } }
+
 internal enum class LabyrinthEventFreeRoleBlockedAction { WAIT, STOP }
 
 /**
@@ -7827,6 +7831,8 @@ class LabyrinthEntryRecognitionSession(
                         ?.nextNode
                         ?.takeIf { it.blockId == action.blockId }
                         ?.area
+                        // 区域号以节点编号为准：routeProgress 在区域边界会提前翻页，编号不会。
+                        ?: labyrinthNodeAreaOf(action.blockId)
                         ?: _state.value.routeProgress?.currentArea
                     prepareNodeTransitionContext(action.blockType, targetArea)
                     pendingNodeTransition = PendingNodeTransition(
