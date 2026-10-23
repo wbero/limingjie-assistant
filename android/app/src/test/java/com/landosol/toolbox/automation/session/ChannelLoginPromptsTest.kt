@@ -74,7 +74,7 @@ class ChannelLoginPromptsTest {
 
     @Test
     fun `channels without known prompts have no rules`() {
-        // 4399 / 应用宝 / MuMu are hard-closed before a reroll instead of having dialogs tapped.
+        // These channel SDKs use task-stack restart instead of having these dialogs tapped.
         for (server in listOf(
             GameServer.CN_4399,
             GameServer.CN_TENCENT,
@@ -541,12 +541,12 @@ class ChannelLoginPromptsTest {
     }
 
     @Test
-    fun `only 4399, 应用宝 and MuMu are hard-closed before a reroll`() {
+    fun `4399, 应用宝, MuMu and 九游 use task reset before a reroll`() {
         assertEquals(
-            listOf(GameServer.CN_4399, GameServer.CN_MUMU, GameServer.CN_TENCENT),
-            GameServer.entries.filter(ChannelSdkTraits::closesClientBeforeReroll),
+            listOf(GameServer.CN_ALIGAMES, GameServer.CN_4399, GameServer.CN_MUMU, GameServer.CN_TENCENT),
+            GameServer.entries.filter(ChannelSdkTraits::requiresTaskResetBeforeReroll),
         )
-        assertTrue(!ChannelSdkTraits.closesClientBeforeReroll(null))
+        assertTrue(!ChannelSdkTraits.requiresTaskResetBeforeReroll(null))
     }
 
     @Test

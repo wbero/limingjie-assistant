@@ -120,12 +120,13 @@ internal fun gameSessionResetReadyDecision(
 }
 
 /**
- * 会话重置编排：保存本局结果 → 关闭客户端 → 重启 → 等登录 → 主页 → 冒险 →
+ * 会话重置编排：保存本局结果 → 重置/触发旧会话失效 → 启动客户端 → 等登录 → 主页 → 冒险 →
  * 黎明界 → 就绪下一轮。复用共享自动化会话仲裁、截图帧总线与悬浮窗。
  */
 class GameSessionResetWorkflow(
     private val sessionManager: AutomationSessionManager,
     private val backend: GameSessionResetBackend,
+    private val taskResetRelauncher: suspend () -> GameClientRelaunchResult = { backend.relaunchClient() },
     private val captureActive: () -> Boolean = CaptureStateRegistry::isActive,
     private val processorFactory: () -> (CapturedFrame) -> LabyrinthEntryFrameResult,
     private val blockClassifier: (LabyrinthEntryFrameResult) -> SessionBlockKind,
@@ -181,30 +182,26 @@ class GameSessionResetWorkflow(
     @Volatile
     private var lastChannelPromptPollAt = Long.MIN_VALUE
 
-    /**
-     * Set when this run cold-starts a client that was hard-closed before the reroll. Until the
-     * title page is seen, no frame may complete the reset or drive the entry planner: a page from
-     * a process that survived the kill would be taken over with a stale session.
-     */
+    /** Until the restarted task reaches the title, do not drive entry actions on an in-game page. */
     @Volatile
-    private var coldStartGate: ColdStartTitleGate? = null
+    private var freshTaskLaunchGate: FreshTaskLaunchGate? = null
 
     init {
         require(totalTimeoutMillis > 0)
     }
 
     /**
-     * @param clientHardClosed the caller has just hard-closed the client (大退) before a reroll, so
-     *   there is no session to invalidate and no point waiting for the client to show up: cold-start
-     *   it and let the entry planner log in from the title.
+     * @param taskResetRequested the caller prepared a task-stack restart before the reroll. The
+     *   client sync should restart its task and drive entry from the title rather than invalidate
+     *   the prior session.
      */
-    suspend fun start(clientHardClosed: Boolean = false): GameSessionResetStartResult = mutex.withLock {
-        startLocked(onSaveRoundResult, clientHardClosed)
+    suspend fun start(taskResetRequested: Boolean = false): GameSessionResetStartResult = mutex.withLock {
+        startLocked(onSaveRoundResult, taskResetRequested)
     }
 
     private suspend fun startLocked(
         saveRoundResult: suspend () -> Unit,
-        clientHardClosed: Boolean = false,
+        taskResetRequested: Boolean = false,
     ): GameSessionResetStartResult {
         activeSessionId?.let { return GameSessionResetStartResult.AlreadyRunning(it) }
         if (!captureActive()) {
@@ -259,7 +256,7 @@ class GameSessionResetWorkflow(
         channelPromptVisibleUntil = Long.MIN_VALUE
         lastChannelPromptPollAt = Long.MIN_VALUE
         channelPrompts?.reset()
-        coldStartGate = if (clientHardClosed) ColdStartTitleGate() else null
+        freshTaskLaunchGate = null
         _state.value = GameSessionResetState(
             status = GameSessionResetStatus.RUNNING,
             sessionId = session.id,
@@ -293,7 +290,7 @@ class GameSessionResetWorkflow(
             runResetFlow(
                 sessionId = session.id,
                 saveRoundResult = saveRoundResult,
-                clientHardClosed = clientHardClosed,
+                taskResetRequested = taskResetRequested,
             )
         }
         return GameSessionResetStartResult.Started(session.id)
@@ -340,7 +337,7 @@ class GameSessionResetWorkflow(
     private suspend fun runResetFlow(
         sessionId: AutomationSessionId,
         saveRoundResult: suspend () -> Unit,
-        clientHardClosed: Boolean = false,
+        taskResetRequested: Boolean = false,
     ) {
         val outcome = runCatching {
             withTimeout(totalTimeoutMillis) {
@@ -354,9 +351,9 @@ class GameSessionResetWorkflow(
                 // A round can begin while the client is still opening. Give it time to reach the
                 // foreground before judging which page it is on; otherwise every frame belongs to
                 // the launcher and the peek below can only report UNKNOWN.
-                // A hard-closed client cannot appear on its own; waiting for it only costs time.
-                if (!clientHardClosed) awaitClientObserved(sessionId, CLIENT_PRESENCE_TIMEOUT_MILLIS)
-                val observedPage = if (clientHardClosed) {
+                // A task-reset request will explicitly launch the client after this peek.
+                if (!taskResetRequested) awaitClientObserved(sessionId, CLIENT_PRESENCE_TIMEOUT_MILLIS)
+                val observedPage = if (taskResetRequested) {
                     LabyrinthEntryPageState.UNKNOWN
                 } else {
                     awaitObservedPage(sessionId, PAGE_PEEK_TIMEOUT_MILLIS)
@@ -366,18 +363,18 @@ class GameSessionResetWorkflow(
                 // session, timed out, and the reset failed before WAITING_LOGIN, the only stage
                 // that handles the dialog). A channel login prompt on screen means the client is
                 // still logging in: there is no session to invalidate.
-                val channelPrompt = if (clientHardClosed) null else channelPrompts?.peek()
-                val skipTermination = clientHardClosed || channelPrompt != null ||
+                val channelPrompt = if (taskResetRequested) null else channelPrompts?.peek()
+                val skipTermination = taskResetRequested || channelPrompt != null ||
                     gameSessionResetSkipsTermination(observedPage, clientObserved)
                 Log.d(
                     LOG_TAG,
-                    "peek page=$observedPage clientObserved=$clientObserved hardClosed=$clientHardClosed " +
+                    "peek page=$observedPage clientObserved=$clientObserved taskReset=$taskResetRequested " +
                         "channelPrompt=${channelPrompt?.rule?.id} skipTermination=$skipTermination",
                 )
                 if (skipTermination) {
                     setMessage(
                         when {
-                            clientHardClosed -> "游戏已在刷开局前大退，冷启动公主连结"
+                            taskResetRequested -> "重建游戏任务栈并启动公主连结"
                             channelPrompt != null -> "客户端停在渠道登录界面（${channelPrompt.rule.label}），无需触发会话失效"
                             !clientObserved -> "未看到公主连结画面，没有可失效的旧会话；直接进入登录导航"
                             else -> "客户端在 ${observedPage.name}，尚未载入黎明界，无需触发会话失效"
@@ -385,12 +382,13 @@ class GameSessionResetWorkflow(
                     )
                     // Nothing was terminated, so the client may simply not be running. Ask the
                     // backend to bring it up; the entry planner drives everything after that.
-                    if (clientHardClosed || !clientObserved) {
+                    if (taskResetRequested || !clientObserved) {
                         transitionTo(sessionId, GameSessionResetStage.RELAUNCHING, "启动公主连结")
-                        val relaunch = backend.relaunchClient()
+                        val relaunch = if (taskResetRequested) taskResetRelauncher() else backend.relaunchClient()
                         if (relaunch != GameClientRelaunchResult.LAUNCH_REQUESTED) {
                             error("启动客户端失败：$relaunch")
                         }
+                        if (taskResetRequested) freshTaskLaunchGate = FreshTaskLaunchGate()
                     }
                 } else {
                     // 3. 关闭/退出客户端（ADB force-stop 或会话失效触发弹窗返回标题）
@@ -605,13 +603,11 @@ class GameSessionResetWorkflow(
                         backend.kind == ClientTerminationKind.SESSION_EXPIRY
                 if (block != SessionBlockKind.NONE && !expectedExpiryPopup) {
                     stage = GameSessionResetStage.SESSION_BLOCKED
-                    // A session prompt before the title of a hard-closed client most likely means
-                    // the old process is still there and just met 6002.
-                    val beforeColdStartTitle = coldStartGate?.titleSeen == false
+                    val beforeFreshTaskTitle = freshTaskLaunchGate?.titleSeen == false
                     _state.value = _state.value.copy(
                         stage = GameSessionResetStage.SESSION_BLOCKED,
-                        message = if (beforeColdStartTitle) {
-                            "会话被阻塞：$block（冷启动尚未出现标题页，可能大退未生效、游戏进程仍在）"
+                        message = if (beforeFreshTaskTitle) {
+                            "会话被阻塞：$block（任务重建后尚未出现标题页）"
                         } else {
                             "会话被阻塞：$block"
                         },
@@ -632,19 +628,19 @@ class GameSessionResetWorkflow(
                     _state.value = _state.value.copy(message = "识别客户端当前页面：${pageState.name}")
                     return@launch
                 }
-                coldStartGate?.let { gate ->
+                freshTaskLaunchGate?.let { gate ->
                     when (gate.observe(pageState)) {
-                        ColdStartVerdict.CONFIRMED -> Unit
-                        ColdStartVerdict.PENDING -> if (pageState != LabyrinthEntryPageState.UNKNOWN &&
+                        FreshTaskLaunchVerdict.CONFIRMED -> Unit
+                        FreshTaskLaunchVerdict.PENDING -> if (pageState != LabyrinthEntryPageState.UNKNOWN &&
                             pageState != LabyrinthEntryPageState.GAME_LOADING_PROGRESS
                         ) {
-                            _state.value = _state.value.copy(message = "确认冷启动：等待标题页（当前 ${pageState.name}）")
+                            _state.value = _state.value.copy(message = "确认任务重建：等待标题页（当前 ${pageState.name}）")
                             return@launch
                         }
-                        ColdStartVerdict.CLIENT_SURVIVED -> {
+                        FreshTaskLaunchVerdict.STALE_TASK -> {
                             markFailed(
                                 sessionId,
-                                "大退未生效：冷启动后先出现 ${pageState.name} 而不是标题页，游戏进程仍在；" +
+                                "任务重建后先出现 ${pageState.name} 而不是标题页；" +
                                     "已停止，避免接管旧会话导致渠道账号登出",
                             )
                             return@launch
